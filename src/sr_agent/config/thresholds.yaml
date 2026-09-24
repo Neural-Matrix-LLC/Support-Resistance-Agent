@@ -1,0 +1,45 @@
+# Constants shared by every phase (SR_Technical_Document §2.7).
+# Keys listed under `frozen` are fixed by BUILD-PLAN and asserted by
+# tests/unit/test_config.py; change BUILD-PLAN first, then the test, then this.
+atr_window: 20            # BP §7.1, §3.6.1
+horizon_sessions: 5       # BP §7.1
+delta_atr: 0.25           # breach buffer δ, BP §7.1
+r_min_atr: 0.5            # reaction threshold R_min, BP §7.1
+dq_suppress: 0.7          # BP §9.3
+publish:                  # BP §10.5
+  p_touch: 0.60
+  p_hold: 0.65
+  confidence: 0.70
+  dq: 0.80
+identity_match_atr: 0.25  # BP §6.1
+cluster:                  # P2 HDBSCAN (initial; tuned inside walk-forward only)
+  eps_atr: 0.25
+  min_cluster_size: 2
+frozen:
+  - atr_window
+  - horizon_sessions
+  - delta_atr
+  - r_min_atr
+  - dq_suppress
+  - publish
+  - identity_match_atr
+
+# P0 walking skeleton (SR_Technical_Document §3.6). All `initial` — none frozen.
+p0:
+  swing:
+    k_atr: [0.5, 1.0, 1.5, 2.0]   # design-fixed §9, BP §6.2 family A
+    window: 3                     # initial
+    confirm_max_sessions: 20      # m ≤ 20, initial
+    half_width_atr: 0.1           # initial; superseded by learned q in P2
+    keep_within_atr: 6.0          # initial
+  round:
+    multipliers: [10, 20, 100]
+    radius_atr: 3.0               # initial
+    half_width_atr: 0.1
+  naive_cluster:
+    eps_atr: 0.5                  # initial; HDBSCAN in P2
+    max_per_side: 4
+  mc:
+    n_paths: 10000
+    lookback: 500
+    seed: 0

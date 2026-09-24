@@ -1,0 +1,23 @@
+# Per-market constants (SR_Technical_Document §2.7). Owner phase: P0.
+# `close_utc` is the standard-time fallback only; the loader takes each
+# session's exact close (DST, half-days) from exchange_calendars.
+US:
+  calendar: XNYS
+  currency: USD
+  close_utc: "20:00"
+  bar_publication_lag_minutes: 0
+  tick_size: 0.01
+  price_limit: null
+  stooq_suffix: ".US"
+  yfinance_suffix: ""
+  round_number_multipliers: [10, 20, 100]
+HK:
+  calendar: XHKG
+  currency: HKD
+  close_utc: "08:00"
+  bar_publication_lag_minutes: 0
+  tick_size: null          # HKEX spread table; resolved in P4
+  price_limit: null
+  stooq_suffix: ".HK"
+  yfinance_suffix: ".HK"   # numeric codes are zero-padded to 4 digits (0700.HK)
+  round_number_multipliers: [10, 20, 100]

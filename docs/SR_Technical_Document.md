@@ -34,9 +34,9 @@
 | # | Decision | Consequence for the design |
 |---|---|---|
 | D1 | **No monthly data budget → Tier-0 sources only** (BP §5.1, §15 "budget ceiling"). | Options/GEX (BP family G), intraday bars, off-exchange prints, and minute-level volume profile are **not built**. The product is a **daily-bar forecaster**. All schema slots for these sources are kept with `*_available = 0` (BP §5, design-fixed §76). A zero-cost nightly archive of the free CBOE options snapshot is started in P1 (§4.5) so a future options module could be backtested; no module consumes it in this plan. |
-| D2 | **US first, HK second**, other markets deferred (BP §1.2, §15). | P0–P3 are US (S&P 500 + 400, point-in-time). HK (Hang Seng constituents via Stooq `.HK` daily bars) enters in P4 as the generalisation test. China A-share price-limit truncation is a hook in the MC engine (§6.6.6), inactive. |
+| D2 | **US first, HK second**, other markets deferred (BP §1.2, §15). | P0–P3 are US (S&P 500 + 400, point-in-time). HK (Hang Seng constituents via yfinance `.HK` daily bars) enters in P4 as the generalisation test. China A-share price-limit truncation is a hook in the MC engine (§6.6.6), inactive. |
 | D3 | **Horizon H = 5 local sessions** (BP §3, design-fixed §3). | Session arithmetic goes through `exchange_calendars` everywhere; never calendar days. |
-| D4 | **Price spine = Stooq** (bulk daily, US + HK), **Tiingo free tier for reconciliation only**. | Tiingo's free tier caps (documented in §2.5) cannot serve a ~900-name universe, but comfortably serve the P1 reconciliation sample of 50 tickers × 200 dates. `yfinance` is dev-only cross-check, never a source of truth (BP §5.1). |
+| D4 | **Price spine = yfinance** (Yahoo daily bars, US + HK, no token), **Tiingo free tier for reconciliation only**. *Revised 2026-09-18: the spine was Stooq; its CSV endpoint now requires a browser proof-of-work, so Stooq is a manual-download fallback only. Ingestion is source-pluggable (§3.4).* | Yahoo's OHLC is split-adjusted back through time (dividends are not) — P1's corporate-action layer treats it as split-adjusted raw, not unadjusted raw as Stooq was. Tiingo's *unadjusted* history is unusable as a level source without adjustment (AAPL's pre-2014 $300s produced swing candidates next to today's spot in the P0 live run); its free-tier caps (§2.5) cannot serve a ~900-name universe but comfortably serve the P1 reconciliation sample of 50 tickers × 200 dates. `yfinance` is unofficial (scrapes Yahoo's public API) — rate-limit politely, cache everything, and keep the source boundary so a replacement is one class. |
 | D5 | **Point-in-time universe from a hand-curated membership CSV** built from published S&P 500/400 change histories plus EDGAR delisting evidence. | This is the P1 kill-criterion risk (BP §12 P1). §4.6.4 defines what "cannot assemble" means and the descope path. |
 | D6 | **Storage = Parquet lake + DuckDB catalogue**, single workstation (BP §1.2, §11). | No services to run. DuckDB file `data/sr.duckdb` holds catalogue views over Parquet plus small mutable tables (forecast store, registry). |
 | D7 | **LightGBM is the production model; deep learning is a challenger** (BP §8). | P5's sequence model ships only if it beats LightGBM out-of-sample with CI excluding zero. |
@@ -57,8 +57,6 @@ flowchart TB
         VERIFY["Verifier (numeric grounding)"]
     end
 
-    AGENT -- "MCP tool calls: typed, validated, logged, as_of-scoped" --> CORE
-
     subgraph CORE["DETERMINISTIC CORE — pure Python, no LLM"]
         direction TB
         DATA["data/ — PIT store · corporate actions · calendars · DQ (P1)"]
@@ -76,14 +74,14 @@ flowchart TB
     end
 
     subgraph STORE["STORAGE — Parquet lake + DuckDB catalogue"]
-        LAKE[("data/lake/*.parquet\nraw · adjusted · levels · features · labels")]
-        DUCK[("data/sr.duckdb\ncatalogue views · forecast store · registry")]
-        TRIALS[("research/trials.jsonl\nevery configuration evaluated")]
-        MLF[("mlruns/ (MLflow)\nmodel registry")]
+        LAKE[("data/lake/*.parquet<br/>raw · adjusted · levels · features · labels")]
+        DUCK[("data/sr.duckdb<br/>catalogue views · forecast store · registry")]
+        TRIALS[("research/trials.jsonl<br/>every configuration evaluated")]
+        MLF[("mlruns/ (MLflow)<br/>model registry")]
     end
 
     subgraph SRC["TIER-0 DATA SOURCES (free)"]
-        STOOQ["Stooq daily OHLCV (US, HK)"]
+        STOOQ["yfinance daily OHLCV (US, HK)"]
         TIINGO["Tiingo free tier (reconciliation)"]
         EDGAR["SEC EDGAR filings + timestamps"]
         FRED["FRED macro series"]
@@ -91,12 +89,18 @@ flowchart TB
         XCAL["exchange_calendars"]
     end
 
+    FS["forecast store (append-only)"]
+    API["api/ — GET /forecast/#123;ticker#125; (P4)"]
+    REPORT["reporting/ — terminal · HTML · dashboard (P4, P6)"]
+    SCHED["Prefect weekly flow (P6)"]
+
+    AGENT -- "MCP tool calls: typed, validated, logged, as_of-scoped" --> CORE
     SRC --> DATA
     CORE <--> STORE
-    CAL --> FS["forecast store (append-only)"]
-    FS --> API["api/ — GET /forecast/{ticker} (P4)"]
-    FS --> REPORT["reporting/ — terminal · HTML · dashboard (P4, P6)"]
-    SCHED["Prefect weekly flow (P6)"] --> CORE
+    CAL --> FS
+    FS --> API
+    FS --> REPORT
+    SCHED --> CORE
 
     classDef llm fill:#fff4e6,stroke:#e8a33d
     class PLAN,EXTRACT,NARR,VERIFY llm
@@ -106,13 +110,14 @@ The MCP boundary is the whole point (BP §4): the LLM decides *which* sources to
 
 ### 2.2 Repository layout and layer map
 
-The package tree is BUILD-PLAN §11, annotated with the phase that first creates each module.
+The package tree is BUILD-PLAN §11, annotated with the phase that first creates each module. On disk the package lives under `src/sr_agent/` (src-layout, as in the author's other repos) with `tests/` at the repository root; import paths are unchanged (`sr_agent.levels.cluster`).
 
 ```text
 sr_agent/
 ├─ config/            markets.yaml · features.yaml · models.yaml · thresholds.yaml        P0 (grows every phase)
-├─ data/              ingestion/{stooq,tiingo,edgar,fred,cboe}.py · adjust.py             P1
-│                     calendars.py · quality.py · universe.py · store.py (PITStore)        P1
+├─ data/              bars.py · calendars.py · ingestion/{base,cache,loader,yfinance,tiingo,stooq}.py  P0
+│                     ingestion/{edgar,fred,cboe}.py · adjust.py                           P1
+│                     quality.py · universe.py · store.py (PITStore)                       P1
 ├─ levels/            generators/{structure,round,volume_profile,vwap,technical,          P0: structure, round
 │                                 statistical,options}.py                                  P2: the rest (options = stub)
 │                     cluster.py · zone.py · identity.py · state_machine.py               P0 naive cluster · P2 full
@@ -177,7 +182,7 @@ Layer discipline (enforced by import-linter in CI from P1):
 
 **Session arithmetic.** `sessions(as_of, n)` returns the next `n` sessions of the security's exchange from `exchange_calendars`; the forecast window is `sessions(t, 5)`. Half-days count as sessions.
 
-**Availability rule.** A row is visible to a query with `as_of` iff `available_at ≤ as_of`. There is no other read path (BP §10.4.3). For daily bars `available_at = session close + publication lag` (default lag 0 for Stooq EOD, set in `markets.yaml`); for EDGAR filings `available_at = acceptance datetime`; for FRED `available_at = release datetime` from the release calendar, never the observation date.
+**Availability rule.** A row is visible to a query with `as_of` iff `available_at ≤ as_of`. There is no other read path (BP §10.4.3). For daily bars `available_at = session close + publication lag` (default lag 0 for daily EOD bars, set in `markets.yaml`); for EDGAR filings `available_at = acceptance datetime`; for FRED `available_at = release datetime` from the release calendar, never the observation date.
 
 ### 2.5 Data sources — Tier-0 catalogue
 
@@ -185,7 +190,8 @@ All sources are free. Every source is optional at forecast time; missing sources
 
 | Source | What we take | Access | Limits & notes | Landing table | First used |
 |---|---|---|---|---|---|
-| **Stooq** | Daily OHLCV, US (`.US`) and HK (`.HK`); also index/ETF series (SPY, sector ETFs, `^SPX`, `^HSI`) | Per-symbol CSV `https://stooq.com/q/d/l/?s={sym}&i=d`; bulk daily archives for backfill | Unadjusted for dividends; split-adjusted inconsistently → we treat Stooq as **raw** and apply our own corporate actions. Polite rate: ≤ 1 req/s, cache everything. Limited delisted coverage (→ D5). | `bar_daily_raw` | P0 |
+| **yfinance** (Yahoo) | Daily OHLCV, US and HK (`0700.HK`); also index/ETF series (SPY, sector ETFs, `^GSPC`, `^HSI`) | `yfinance.Ticker(sym).history(period="max", auto_adjust=False)` → CSV in the raw cache | Split-adjusted back through time, dividends unadjusted (`Adj Close` carries them) → treated as **split-adjusted raw**; our own corporate-action layer handles dividends and re-checks splits against Tiingo. Serves the partial bar of an open session (cut by the availability rule). Occasional inverted bars (`0700.HK` 2009-12-31 and 2010-01-15 have `high < low`) — kept raw, flagged by the P1 DQ score (§4.6.3). Unofficial client: polite rate, cache everything. Limited delisted coverage (→ D5). | `bar_daily_raw` | P0 |
+| **Stooq** | Manual fallback: browser-downloaded per-symbol CSV (`https://stooq.com/q/d/l/?s={sym}&i=d`) dropped into the raw cache | CSV endpoint behind a JavaScript proof-of-work since 2026-09; not solved programmatically | Unadjusted for dividends; split-adjusted inconsistently. | `bar_daily_raw` (source=`stooq`) | P0 (fallback) |
 | **Tiingo (free tier)** | Daily OHLCV + adjusted close, split/dividend factors, for the reconciliation sample and CA cross-check | REST `https://api.tiingo.com/tiingo/daily/{ticker}/prices`, token | Free-tier caps (verify at sign-up; treat as hard limits in `markets.yaml`): ~50 req/hr, ~1 000 req/day, ~500 unique symbols/month. Enough for 50 tickers × 200 dates. | `bar_daily_ref`, `corporate_action` (source=`tiingo`) | P1 |
 | **SEC EDGAR** | Filing index with acceptance timestamps (8-K, 10-Q, 10-K, Form 25, Form 15), full text for extraction | `https://data.sec.gov/submissions/CIK##########.json`; full-text search `https://efts.sec.gov/LATEST/search-index?q=…`; documents from `https://www.sec.gov/Archives/` | Descriptive `User-Agent: SR-Agent <email>`; ≤ 10 req/s; no key. Acceptance datetime is `available_at`. | `filing`, `document` | P1 (index), P4 (text) |
 | **FRED** | Macro series (DGS10, DFF, VIXCLS, …) and the release calendar | `https://api.stlouisfed.org/fred/series/observations`, free key; `fred/releases/dates` | Unlimited for our volume. Use *vintage* (ALFRED) endpoints for revised series so `available_at` is the release date. | `macro_series`, `macro_release` | P1 |
@@ -193,7 +199,6 @@ All sources are free. Every source is optional at forecast time; missing sources
 | **`exchange_calendars`** | Sessions, holidays, half-days for XNYS, XHKG (XSHG/XSHE for the inactive limit hook) | Python package | Pin the version; sessions are computed, not stored, but a materialised `session_calendar` table exists for SQL joins. | `session_calendar` | P0 |
 | **Index membership (curated)** | Point-in-time S&P 500 / S&P 400 / Hang Seng membership intervals | `data/curated/index_membership.csv`, maintained by hand from published change histories (Wikipedia "List of S&P 500 companies" change table and its edit history; S&P Dow Jones Indices press releases; HSI announcements), one source URL per row | This is the survivorship-bias defence (BP §12 P1). Rows: `(index, ticker_at_time, security_id, start_date, end_date, source_url)`. | `universe_membership` | P1 |
 | **EDGAR Form 25 / Form 15** | Delisting / deregistration evidence with dates, to close membership intervals and mark `security_master.delisting_date` | EDGAR full-text search on form type | Free; the only free authoritative delisting record. | `security_master`, `corporate_action` (type=`delist`) | P1 |
-| `yfinance` | Dev-only convenience cross-check | package | Never a source of truth, never read by the PIT store (BP §5.1). | — | dev |
 
 **Explicitly not used (D1):** Tiingo Power, EODHD, Polygon/Massive, Databento, any LOB or dark-pool feed. `features.yaml` still declares the `options`, `offexchange`, `orderbook`, and `intraday_vp` groups so that the feature matrix shape is stable; their `_available` flags are always 0.
 
@@ -204,7 +209,7 @@ All sources are free. Every source is optional at forecast time; missing sources
 ```text
 data/
 ├─ raw/                        immutable downloads, one file per (source, symbol, fetch_date)
-│   └─ stooq/AAPL.US/2026-09-12.csv
+│   └─ yfinance/AAPL/2026-09-19.csv
 ├─ lake/                       Parquet, Hive-partitioned; written only by ingestion/pipeline jobs
 │   ├─ bar_daily_raw/market=US/year=2026/*.parquet
 │   ├─ bar_daily_adj/market=US/year=2026/*.parquet
@@ -378,7 +383,7 @@ erDiagram
 
 | File | Keys (initial) | Owner phase |
 |---|---|---|
-| `markets.yaml` | per market: `calendar` (XNYS/XHKG), `close_utc`, `bar_publication_lag_minutes`, `tick_size`, `price_limit` (`null` for US/HK; `±0.10` hook for A-shares), `stooq_suffix`, `round_number_multipliers` | P0 |
+| `markets.yaml` | per market: `calendar` (XNYS/XHKG), `close_utc`, `bar_publication_lag_minutes`, `tick_size`, `price_limit` (`null` for US/HK; `±0.10` hook for A-shares), `yfinance_suffix`, `stooq_suffix`, `round_number_multipliers` | P0 |
 | `thresholds.yaml` | `atr_window: 20`, `horizon_sessions: 5`, `delta_atr: 0.25`, `r_min_atr: 0.5`, `dq_suppress: 0.7`, `publish: {p_touch: 0.60, p_hold: 0.65, confidence: 0.70, dq: 0.80}`, `dq_weights`, `cluster: {eps_atr: 0.25, min_cluster_size: 2}`, `identity_match_atr: 0.25` | P0, P1, P2 |
 | `features.yaml` | 20 groups, each: `enabled`, `lookback_sessions`, `available_at_rule`, and the feature list with `dtype` | P3 |
 | `models.yaml` | walk-forward schedule, purge/embargo, LightGBM params per target, isotonic strata + min-n ladder, MC params (`n_paths`, `block_len`, `seed`) | P3 |
@@ -404,7 +409,7 @@ The forecast JSON is BUILD-PLAN §3.2, `schema_version: "1.0"`, frozen at P1 and
 
 ```mermaid
 flowchart LR
-    STOOQ["Stooq CSV\n(AAPL.US, daily)"]:::new --> LOAD["data/ingestion/stooq.py\nload_bars()"]:::new
+    STOOQ["yfinance history\n(AAPL, daily)"]:::new --> LOAD["data/ingestion/loader.py\nload_bars()"]:::new
     LOAD --> ATR["levels/atr.py\natr20()"]:::new
     ATR --> SW["levels/generators/structure.py\nSwingGenerator"]:::new
     ATR --> RN["levels/generators/round.py\nRoundNumberGenerator"]:::new
@@ -414,7 +419,7 @@ flowchart LR
     ATR --> MC["simulate/monte_carlo.py\nBootstrapPathSimulator"]:::new
     Z --> MC
     MC --> OUT["reporting/render.py\nprint_report()"]:::new
-    CACHE[("data/raw/stooq/AAPL.US/*.csv")]:::new -.-> LOAD
+    CACHE[("data/raw/yfinance/AAPL/*.csv")]:::new -.-> LOAD
     classDef new stroke-width:3px
 ```
 
@@ -425,7 +430,7 @@ Everything is new; every box is a module that survives into later phases (the *n
 ```mermaid
 sequenceDiagram
     participant CLI as cli.py (sr p0)
-    participant ST as StooqLoader
+    participant ST as load_bars
     participant AT as atr20
     participant GEN as Generators
     participant CL as NaiveClusterer
@@ -526,8 +531,13 @@ classDiagram
 
 | Module | Class / function | Responsibility | Inputs → Outputs |
 |---|---|---|---|
-| `data/ingestion/stooq.py` | `load_bars(ticker, market, as_of)` | Download-or-read-cache the Stooq daily CSV; parse to Polars; drop rows after `as_of`; attach `available_at = session close` | `str, str, date → Bars` |
-| `levels/atr.py` | `atr20(bars)` | Wilder ATR (§3.6.1) | `Bars → Series` |
+| `data/bars.py` | `Bars.from_frame(df, ticker, market, as_of)` | The bar frame every layer consumes; enforces the column set and the availability filter `available_at ≤ as_of` (§2.4) on construction | `DataFrame → Bars` |
+| `data/calendars.py` | `next_sessions`, `session_close_utc`, `is_session` | Session arithmetic via `exchange_calendars` (exact per-session closes, DST- and half-day-aware) | — |
+| `data/ingestion/base.py` | `RawSource` (abstract), `RawSourceError` | One provider of raw daily OHLCV: `symbol()`, `fetch()` (text, the only place network happens), `parse()` (text → normalised frame). The cached artefact is the provider's text, verbatim | — |
+| `data/ingestion/yfinance.py`, `tiingo.py`, `stooq.py` | `YFinanceSource`, `TiingoSource`, `StooqSource` | Tier-0 sources. `yfinance` is the default (D4): `Ticker.history(period="max", auto_adjust=False)` serialised to CSV so the raw cache stays text; US and HK (numeric HK codes zero-padded, `0700.HK`). Tiingo (free tier, `TIINGO_API_KEY`, US only, `--source tiingo`) keeps the unadjusted columns for P1 reconciliation. Stooq's CSV endpoint has sat behind a JavaScript proof-of-work challenge since 2026-09, so its `fetch()` fails with a clear message and its cache path is fed by a manual browser download; we do not solve the challenge programmatically | — |
+| `data/ingestion/cache.py` | `fetch_to_cache`, `pick_cache_file` | Immutable `data/raw/{source}/{SYMBOL}/{fetch_date}.csv`; same-day re-fetch is a no-op, a later fetch adds a file, nothing is ever overwritten | — |
+| `data/ingestion/loader.py` | `load_bars(ticker, market, as_of, data_dir, source, offline, today, now)` | Cache-or-fetch, parse, drop rows after `as_of`, attach `available_at = exact session close + lag`, build `Bars` with the cut `available_at ≤ min(end of as_of, now)` — so the partial bar a provider serves while the session is open is not visible (2026-09-18 finding) | `… → Bars` |
+| `levels/atr.py` | `atr20(bars)`, `atr_at_as_of(bars)` | Wilder ATR (§3.6.1); lives in L2 rather than as a `Bars` method so L1 stays free of level logic | `Bars → Series` |
 | `levels/generators/base.py` | `LevelGenerator`, `CandidateLevel` | Interface every generator implements from here on; `family` is the independence key used in P2 | — |
 | `levels/generators/structure.py` | `SwingGenerator` | Multi-k swing highs/lows (§3.6.2) | `Bars, date → CandidateLevel[]` |
 | `levels/generators/round.py` | `RoundNumberGenerator` | Round-number ladder near spot (§3.6.3) | `Bars, date → CandidateLevel[]` |
@@ -535,14 +545,17 @@ classDiagram
 | `levels/zone.py` | `Zone` | Value object; `side` = support if `center < spot` else resistance; `zone_id` provisional (`{ticker}-{S\|R}-P0-{nn}`) until identity exists in P2 | — |
 | `simulate/monte_carlo.py` | `BootstrapPathSimulator` | Bar-triple bootstrap paths and `P(touch)` (§3.6.5) | `Bars → ndarray[n, H, 3]` |
 | `reporting/render.py` | `print_report(...)` | Fixed-width table to stdout | — |
-| `cli.py` | `sr p0 TICKER` | Wires the above; `--seed`, `--paths`, `--as-of` flags | — |
+| `reporting/export.py` | `P0Dump`, `write_p0_dump(dump, dir)` | `sr p0 --dump DIR`: `run/bars/candidates/zones/triples/paths.csv` — every intermediate of §3.6 (TR and ATR per bar, each candidate with its ATR-unit coordinates and the zone it landed in, τ triples, simulated bars) so the formulas can be re-derived offline; `test_cli.py` does exactly that from the CSVs | — |
+| `cli.py` | `sr p0 TICKER`, `run_p0(bars, n_paths, seed)` | `run_p0` is the pure pipeline on loaded bars (what tests call); the command adds `--as-of`, `--seed`, `--paths`, `--source`, `--offline`, `--data-dir` (`$SR_DATA_DIR`) and loads `.env` | — |
 
 ### 3.5 Data sources & storage
 
 | Source | Used for | Storage |
 |---|---|---|
-| Stooq (`https://stooq.com/q/d/l/?s=aapl.us&i=d`) | The only input | `data/raw/stooq/AAPL.US/{fetch_date}.csv`, immutable; loader picks the newest file ≤ `as_of` |
-| `exchange_calendars` XNYS | Validating that every session in the CSV is a real session (warn, don't fail) and computing `sessions(as_of, 5)` for the report header | none |
+| yfinance (`Ticker("AAPL").history(period="max", auto_adjust=False)`) | Daily bars, default source; split-adjusted OHLC, `Adj Close` kept in the raw file | `data/raw/yfinance/AAPL/{fetch_date}.csv` (header `Date,Open,High,Low,Close,Adj Close,Volume`), immutable; loader picks the newest file with `fetch_date ≤ as_of`, else the newest at all |
+| Tiingo free tier (`https://api.tiingo.com/tiingo/daily/aapl/prices?format=csv`, `Authorization: Token`) | Daily bars, `--source tiingo`; unadjusted OHLCV columns are used, the adjusted ones are kept in the raw file for P1 reconciliation | `data/raw/tiingo/AAPL/{fetch_date}.csv`, same rules |
+| Stooq (`https://stooq.com/q/d/l/?s=aapl.us&i=d`) | Daily bars, via manual browser download while the endpoint requires a browser (see §3.4); `--source stooq --offline` | `data/raw/stooq/AAPL.US/{fetch_date}.csv`, same rules |
+| `exchange_calendars` XNYS/XHKG, built from 1960 | Exact per-session close for `available_at`; validating that every session in the CSV is a real session (warn, don't fail); `sessions(as_of, 5)` for the report header | none |
 
 No DuckDB, no Parquet, no forecast store in P0. The report is stdout only.
 
@@ -576,7 +589,7 @@ Let `P = close_{as_of}` and `e = 10^⌊log₁₀ P⌋` (for `P = 182.4`, `e = 10
 #### 3.6.4 Naive clustering
 
 1. Convert every candidate to ATR units: `x_i = level_i / ATR₂₀`.
-2. Sort ascending; walk once, starting a new cluster whenever `x_i − x_{i−1} > ε`, `ε = 0.5` (**initial**; P2 replaces this with HDBSCAN, §5.6.2).
+2. Sort ascending; walk once, starting a new cluster whenever `x_i − x_first > ε`, where `x_first` is the cluster's first member (cluster diameter ≤ `ε`), `ε = 0.5` (**initial**; P2 replaces this with HDBSCAN, §5.6.2). *Fixed 2026-09-18:* the rule was first written as a gap to the previous member, `x_i − x_{i−1} > ε`. That is single linkage: the family-B ladder (rungs 0.07–0.3 ATR apart across ±3 ATR) chained into one cluster containing the spot, which step 4 then dropped, and the walking skeleton produced no resistance zones. The diameter rule bounds every zone's span by `ε` and keeps the §3.7 test (“0.4 ATR apart merge, 0.6 do not”). Known consequence, visible in `sr p0 AAPL --dump`: the ladder *tiles* the window in ≈0.67-ATR zones with `n_families = 1`, and adjacent zones overlap by up to `2 × 0.1·ATR` (the half-width padding). Both are P0-acceptable; HDBSCAN with `min_cluster_size` and the learned `q` (P2) must not inherit them.
 3. For each cluster: `center = mean(level_i)`, `L = min(lower_i)`, `U = max(upper_i)`, `provenance = members`, `side = support if center < spot else resistance`, `distance_atr = (center − spot)/ATR₂₀`.
 4. Drop clusters whose interval contains the spot (neither side). Rank each side by `|distance_atr|` ascending and keep the nearest 4 per side for the report.
 
@@ -610,15 +623,17 @@ which is exactly the touch definition in §2.4 applied to simulated bars. This e
 - `tests/unit/test_round.py` — `P = 182.4` yields rungs `{170,175,180,185,190,…}` ∩ `±3·ATR`.
 - `tests/unit/test_cluster.py` — two levels 0.4 ATR apart merge, 0.6 ATR apart do not.
 - `tests/unit/test_mc.py` — with `seed` fixed, `simulate()` is byte-identical across two calls; a zone containing the spot has `P(touch) = 1.0`; a zone 50 ATR away has `P(touch) = 0.0`.
-- Gate: `uv run sr p0 AAPL` exits 0 and prints ≥ 1 support and ≥ 1 resistance zone with `0 < P(touch) < 1`.
+- Gate: `uv run sr p0 AAPL` exits 0 and prints ≥ 1 support and ≥ 1 resistance zone with `0 < P(touch) < 1`. Mechanised, offline, in `tests/unit/test_cli.py` on a 600-session synthetic cache (also asserts replay determinism and the < 10 s budget). Also present: `test_config.py` (frozen constants = BUILD-PLAN), `test_layering.py` (L0–L5 import edges), `test_ingestion.py` (sources incl. a monkeypatched yfinance history, immutable cache, point-in-time cut, the open-session partial-bar cut, `available_at` stamping), `test_calendars.py`, and `test_cli.py::test_dump_csvs_reproduce_the_report_offline` (re-derives TR/ATR, the §3.6.4 geometry and `P(touch)` from the `--dump` CSVs alone); live-provider checks (yfinance US + HK, Tiingo, Stooq status) are `@pytest.mark.integration` and opt-in.
 
 ### 3.8 Deliverables
 
-- [ ] `uv init`, Python 3.11, `pyproject.toml` with `polars numpy exchange_calendars typer`; the §2.2 package skeleton with empty `__init__.py`.
-- [ ] `config/markets.yaml`, `config/thresholds.yaml` with the frozen constants.
-- [ ] Modules in §3.4; `sr p0` CLI.
-- [ ] The five unit tests above.
-- [ ] `.gitignore` covers `data/`, `mlruns/`.
+- [x] `uv init`, Python 3.11, `pyproject.toml` with `polars numpy exchange_calendars typer pyyaml python-dotenv`; the §2.2 package skeleton with empty `__init__.py`. *(2026-09-18)*
+- [x] `config/markets.yaml`, `config/thresholds.yaml` with the frozen constants.
+- [x] Modules in §3.4; `sr p0` CLI.
+- [x] The five unit tests above, plus config/layering/ingestion/calendar/CLI suites (63 tests, 59 offline).
+- [x] `sr p0 --dump DIR` CSV export for offline validation of every §3.6 formula. *(2026-09-19)*
+- [x] `.gitignore` covers `data/`, `mlruns/`.
+- [x] Live gate run `uv run sr p0 AAPL` — Tiingo on 2026-09-18 (9 246 bars, 1.91 s, 8 zones) and yfinance on 2026-09-19 (11 534 bars, 1.49 s, 8 zones, same spot/ATR); see HISTORY.md.
 
 ---
 
@@ -635,7 +650,7 @@ which is exactly the touch definition in §2.4 applied to simulated bars. This e
 ```mermaid
 flowchart TB
     subgraph SRC["Tier-0 sources"]
-        STOOQ["Stooq daily CSV"]
+        STOOQ["yfinance daily bars"]
         TIINGO["Tiingo free tier"]:::new
         EDGAR["SEC EDGAR submissions + FTS"]:::new
         FRED["FRED / ALFRED"]:::new
@@ -643,7 +658,7 @@ flowchart TB
         CUR["curated/index_membership.csv"]:::new
     end
     subgraph ING["data/ingestion/ — Ingestor subclasses"]
-        I1["StooqIngestor"]:::new
+        I1["YFinanceIngestor"]:::new
         I2["TiingoIngestor"]:::new
         I3["EdgarClient"]:::new
         I4["FredClient"]:::new
@@ -686,7 +701,7 @@ flowchart TB
 ```mermaid
 flowchart LR
     A["1. UniverseBuilder\ncurated CSV + EDGAR Form 25/15\n→ security_master, universe_membership"] --> B["2. Symbol list =\nall securities ever in universe"]
-    B --> C["3. StooqIngestor\nraw CSV → data/raw → lake/bar_daily_raw"]
+    B --> C["3. YFinanceIngestor\nraw CSV → data/raw → lake/bar_daily_raw"]
     B --> D["4. TiingoIngestor (sample + CA)\n→ lake/bar_daily_ref, lake/corporate_action"]
     C --> E["5. CorporateActionAdjuster\nraw + actions → lake/bar_daily_adj (+atr20)"]
     D --> E
@@ -727,7 +742,7 @@ classDiagram
         +land(DataFrame, partition) None
         +run(symbols, start, end) IngestReport
     }
-    class StooqIngestor
+    class YFinanceIngestor
     class TiingoIngestor {
         +RateLimiter limiter
         +fetch_corporate_actions(symbol)
@@ -785,7 +800,7 @@ classDiagram
         +assert_no_future(df, as_of) None
         +probe_feature(fn, security_id, as_of) None
     }
-    Ingestor <|-- StooqIngestor
+    Ingestor <|-- YFinanceIngestor
     Ingestor <|-- TiingoIngestor
     PITStore ..> AsOfQuery
     PITStore ..> SessionCalendar
@@ -798,7 +813,7 @@ classDiagram
 | Module | Class | Responsibility | Inputs → Outputs |
 |---|---|---|---|
 | `data/ingestion/base.py` | `Ingestor` | Fetch → raw file (immutable) → parse → Parquet partition. Every landed row gets `source`, `event_ts`, `available_at`, `ingested_at`. | symbols, dates → `IngestReport{n_rows, n_new, errors}` |
-| `data/ingestion/stooq.py` | `StooqIngestor` | Price spine. `available_at = SessionCalendar.close_ts(session) + bar_publication_lag`. | → `bar_daily_raw` |
+| `data/ingestion/yfinance.py` | `YFinanceIngestor` | Price spine (D4; the P0 `YFinanceSource` grown into an `Ingestor`). `available_at = SessionCalendar.close_ts(session) + bar_publication_lag`; rows are split-adjusted at source, flagged `adjusted_for = "splits"`. | → `bar_daily_raw` |
 | `data/ingestion/tiingo.py` | `TiingoIngestor` | Reference prices + split/dividend factors for the sample; token-bucket limiter obeying the free-tier caps. | → `bar_daily_ref`, `corporate_action` |
 | `data/ingestion/edgar.py` | `EdgarClient` | Submissions JSON → `filing(form, filed, acceptance_ts, accession, url)`; FTS for Form 25/15; CIK ↔ ticker map from `company_tickers.json`. `available_at = acceptance_ts`. | → `filing`, `security_master.cik` |
 | `data/ingestion/fred.py` | `FredClient` | ALFRED vintages so revised series get `available_at = release_ts`. | → `macro_series`, `macro_release` |
@@ -847,10 +862,10 @@ Adjusted `O,H,L,C` are multiplied by `f_t`; adjusted volume is divided by the sp
 
 #### 4.6.2 Reconciliation test (gate a)
 
-Sample 50 securities stratified by (decile of dollar volume) × (has-a-split-since-2010), 200 sessions each, uniformly from 2010–present. For each `(security, session)` compare Stooq-derived `adj_close` with Tiingo's:
+Sample 50 securities stratified by (decile of dollar volume) × (has-a-split-since-2010), 200 sessions each, uniformly from 2010–present. For each `(security, session)` compare spine-derived `adj_close` (yfinance, after our dividend adjustment) with Tiingo's:
 
 ```
-rel_err = |adj_close_stooq − adj_close_tiingo| / adj_close_tiingo
+rel_err = |adj_close_spine − adj_close_tiingo| / adj_close_tiingo
 pass    ⇔  rel_err ≤ 0.001  or  |Δ| ≤ 1 tick
 gate    ⇔  pass rate ≥ 99.0 %  and  no security has pass rate < 95 %
 ```
@@ -878,10 +893,10 @@ DQ = Σ_k w_k·c_k,   w = {missing .20, stale .10, spike .15, ca .20, calendar .
 #### 4.6.4 Point-in-time universe reconstruction (gate b, kill criterion)
 
 1. Load `curated/index_membership.csv`. Every row has a `source_url`. Rows without one are rejected by the loader.
-2. Open intervals (`end_date IS NULL`) for tickers that no longer trade are closed with the EDGAR Form 25 (delisting) or Form 15 (deregistration) acceptance date; if neither exists, with the last Stooq bar date and `source_url = "stooq:last_bar"` flagged as *weak*.
+2. Open intervals (`end_date IS NULL`) for tickers that no longer trade are closed with the EDGAR Form 25 (delisting) or Form 15 (deregistration) acceptance date; if neither exists, with the last spine bar date and `source_url = "yfinance:last_bar"` flagged as *weak*.
 3. Ticker re-use (e.g. a symbol reassigned to a new company) is resolved by CIK: one `security_id` per CIK per listing.
 4. **Gate b** is a query: `COUNT(DISTINCT security_id) WHERE index='SP500' AND start_date ≤ '2015-06-30' < end_date AND delisting_date IS NOT NULL` must be ≥ 60 (the S&P 500 turns over ≈ 20–30 names/yr; 2015→2026 implies well over 100 departures, of which a large fraction were acquisitions or delistings).
-5. **"Cannot assemble"** means: after two weeks of curation, > 10 % of 2015 members have no price history in Stooq or no closing evidence. The descope (BP §12 P1 kill) is then: restrict the universe to securities with complete history *and* keep the delisted ones we did find, and record the coverage ratio in `research/universe_coverage.md` so the survivorship residual is stated, not hidden.
+5. **"Cannot assemble"** means: after two weeks of curation, > 10 % of 2015 members have no price history in the spine (yfinance) or no closing evidence. The descope (BP §12 P1 kill) is then: restrict the universe to securities with complete history *and* keep the delisted ones we did find, and record the coverage ratio in `research/universe_coverage.md` so the survivorship residual is stated, not hidden.
 
 #### 4.6.5 Session arithmetic
 
@@ -1077,7 +1092,7 @@ classDiagram
 
 ### 5.5 Data sources & storage
 
-Inputs: `bar_daily_adj` (via `PITStore`), `filing` (earnings-date anchors for the anchored profiles/VWAPs: the 8-K Item 2.02 acceptance date), index bars (SPY / `^SPX` from Stooq) for the regime labeler. No new external source.
+Inputs: `bar_daily_adj` (via `PITStore`), `filing` (earnings-date anchors for the anchored profiles/VWAPs: the 8-K Item 2.02 acceptance date), index bars (SPY / `^GSPC` from yfinance) for the regime labeler. No new external source.
 
 New tables (level-reaction database, design-fixed §15):
 
@@ -1511,7 +1526,7 @@ classDiagram
 
 ### 6.5 Data sources & storage
 
-Inputs: everything from P1–P2 plus Stooq sector ETF and index bars (XLK, XLF, …, SPY, `^SPX`, `^VIX` via FRED `VIXCLS`) and FRED macro (DGS10, DGS2, DFF, BAMLH0A0HYM2). No new external source.
+Inputs: everything from P1–P2 plus yfinance sector ETF and index bars (XLK, XLF, …, SPY, `^GSPC`, `^VIX` via FRED `VIXCLS`) and FRED macro (DGS10, DGS2, DFF, BAMLH0A0HYM2). No new external source.
 
 | Table / artefact | Grain | Contents | `available_at` |
 |---|---|---|---|
@@ -1742,7 +1757,7 @@ flowchart TB
     subgraph ENRICH["enrichment (each ablation-gated)"]
         E1["features/text.py (a)\nLLM-extracted features"]:::new
         E2["features/sector.py + market.py (b)\nalready live in P3 → ablation only"]
-        E3["HK universe (c)\nStooq .HK · XHKG · market embedding"]:::new
+        E3["HK universe (c)\nyfinance .HK · XHKG · market embedding"]:::new
     end
     E1 --> CORE
     E3 --> CORE
@@ -1906,13 +1921,13 @@ classDiagram
 | `agent/extract.py` | `TextFeatureExtractor` | §7.6.3 | document → `TextFeature[]` |
 | `agent/mcp_server.py` | `MCPServer` | BP §10.1 tools; every tool takes `as_of`; every numeric return carries a `display_string` | — |
 | `features/text.py` | group `text` | Aggregates `text_feature` rows into the registry (latest value per feature with decay, `days_since_filing`) with `available_at = acceptance_ts` | — |
-| `data/universe.py` (ext.) | HK support | Hang Seng membership intervals (curated CSV), `.HK` Stooq symbols, XHKG calendar, `market = "HK"` embedding (categorical) | — |
+| `data/universe.py` (ext.) | HK support | Hang Seng membership intervals (curated CSV), `.HK` yfinance symbols, XHKG calendar, `market = "HK"` embedding (categorical) | — |
 | `api/main.py` | `ForecastAPI` | `GET /forecast/{ticker}?as_of=` → latest stored forecast (never recomputes on a GET; `POST /forecast/{ticker}` triggers the loop) | — |
 | `reporting/render.py` (ext.) | `render_terminal`, `render_html` | Zone ladder (design-fixed §85), probabilities, evidence, narrative, DQ, model versions | — |
 
 ### 7.5 Data sources & storage
 
-Sources: EDGAR document text (§2.5, now fetched), Stooq HK bars and `^HSI`, curated HSI membership CSV. The configured LLM provider(s) are an external dependency but **not a data source**: nothing they return is stored except `text_feature` rows (which pass through the same ablation gate as any feature) and the narrative.
+Sources: EDGAR document text (§2.5, now fetched), yfinance HK bars and `^HSI`, curated HSI membership CSV. The configured LLM provider(s) are an external dependency but **not a data source**: nothing they return is stored except `text_feature` rows (which pass through the same ablation gate as any feature) and the narrative.
 
 | Table | Grain | Columns | `available_at` |
 |---|---|---|---|
@@ -1932,7 +1947,7 @@ Sources: EDGAR document text (§2.5, now fetched), Stooq HK bars and `^HSI`, cur
 Input to the planner role: `coverage{source → available, freshness, dq_component}` and `blockers[]` from `assess_data_quality`, plus the family list. Output is JSON-schema constrained:
 
 ```json
-{"sources": ["stooq_daily", "edgar_filings", "fred_macro"], "families": ["A","B","C","D","E","F"],
+{"sources": ["yfinance_daily", "edgar_filings", "fred_macro"], "families": ["A","B","C","D","E","F"],
  "exclude": [{"family": "C", "reason": "volume flagged stale for 40 sessions"}], "reason": "…"}
 ```
 
@@ -2204,7 +2219,7 @@ There is no gate; the phase is "keep the product honest every week". Provisional
 flowchart TB
     CRON["Prefect schedule\nFriday 21:30 UTC (XNYS) · Friday 09:30 UTC (XHKG)\nsession-calendar aware"]:::new --> FLOW
     subgraph FLOW["ops/flows.py — weekly_forecast_flow"]
-        S1["ingest (P1)\nStooq · EDGAR · FRED · CBOE archive"]
+        S1["ingest (P1)\nyfinance · EDGAR · FRED · CBOE archive"]
         S2["dq_all (P1)"]
         S3["score_last_week (P6)\nreporting/score.py"]:::new
         S4["levels + labels build (P2)"]

@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# SR-Agent: raw cache, lake and experiment tracking (SR_Technical_Document §2.6)
+data/
+mlruns/
