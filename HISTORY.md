@@ -5,6 +5,185 @@ reverse-chronological order. See `CLAUDE.md` for the rule this file follows.
 
 ---
 
+## 2026-09-24 — P1 plan: owner review of the upstream migration (docs only)
+
+**Goal.** Apply the owner's four review points on the Fin-Lambda / myFinData plan (tech doc §4.5.7, §4.6.1, §4.8; BUILD-PLAN §17.2 A7–A8, §17.3, §17.4).
+
+- **yfinance ≥ 0.2.51.** Confirmed: `auto_adjust=True` by default, so O/H/L/C come back split- and dividend-adjusted and `Adj Close` is removed. L1 now says so; the port pins `auto_adjust=False`.
+- **15-min Lambda limit.** Both ports run as `n` round-robin shards plus a sweep. A time guard stops starting new symbols with < 120 s left and marks the rest `skipped`. Sizing: `n = ⌈T_total/(0.6·900 s)⌉` from measured per-symbol durations. Options default to `OPT_SHARDS=3` (≈ 50 underlyings × 10–25 s ≈ 8–20 min sequentially). Chains are written per underlying, and a late sweep capture keeps its own `available_at`.
+- **Status report.** New Lambda `statusReport` (U9), Mon–Fri 20:00 ET, by e-mail and R2 `status/latest.json`. One line per data set: DataName (table), last data date, last run date/time, status (ok/partial/error/stale), symbols ok/expected, rows. It reads the new view `v_load_status`; `load_audit` gains `table_name`, `segment`, `n_ok`, `n_expected`. U10 adds audit rows to the five other daily handlers. SR's `sr status` (S5) prints the same format.
+- **Start date 2008 in `.env`.** `FIRSTTRAINDTE="2008/01/01"` (Fin-Lambda) and `SR_HISTORY_START=2008-01-01` (here). A one-off prepend run (U2b) inserts 2008–09 for listed symbols with `INSERT IGNORE`. §4.6.1 generalises to a per-row load date, `raw_t = Close_t·Π_{t<ex_u≤L_t} r_u`, with a 2009/2010 seam check. A8 is no longer pending: names delisted before the prepend keep a 2010 start, and a 2010/2011 index-year is evaluated only if ≥ 90 % of its members have a full lookback.
+
+**Effort.** SR 46 → 47 h (M7 + `sr status`); upstream 16 → 24 h (U2b 1.5, U3 +1, U4 +0.5, U9 3, U10 2).
+
+**Tests.** No code change; 59 offline tests unchanged. Planned additions:
+- `test_split_state.py`: a prepend seam case;
+- `test_status.py`;
+- Fin-Lambda: shard, time-guard and sweep cases in the options handler test, `test_status_report_handler.py`, and an audit-row test per handler.
+
+---
+
+## 2026-09-24 — P1 plan: Fin-Lambda reuse and myFinData migration (docs only)
+
+**Goal.** Fold the owner's existing collectors into the P1 plan. That means `Fin-Lambda/Ops/fin-cron-data` (ten Lambdas) and the two myFinData cron jobs that load `histdailyprice7` and `OptionChains` (`eoddata_ext.sh` 21:10, `optchain-PM.sh` 21:40). Decide the repository split and count the new modules.
+
+**Decisions** (tech doc §4.5.7, D10; BUILD-PLAN §17.2 A7–A8).
+
+- **Two repositories.** Fin-Lambda owns every MySQL writer and absorbs the two cron jobs as Lambdas `eodDaily` and `optChainEOD`. The cutover follows a 10-session shadow run; myFinData is then archived. This repo stays read-only on MySQL. The contract is data (tables and semantics); code is ported, never imported. There is no third repository for the spine.
+- **Modules.** No new SR collector beyond the five in the P1 design. Upstream: two ported Lambdas, one extension (`portAssetsHandler` + DJIA/HSI), and two new tables (`load_audit`, `corp_action_daily`). SR changes S1–S4: `load_audit`-triggered extract with exact `available_at`, a membership diff, post-cutover actions, and a loader-cache import.
+- **Reuse catalogue.** Twelve upstream assets classified: consumed, ported, pattern, P4 candidate, or never consumed (snapshot tables cannot be point-in-time).
+
+**Findings from reading the loader code** (tech doc §4.5.7 L1–L7).
+
+- **L1.** `auto_adjust` is unpinned; the loader works only on yfinance < 0.2.51.
+- **L2.** It runs on host-local cron: 16:10 ET in winter if the host is UTC.
+- **L3.** It writes one `to_sql` per list with errors swallowed.
+- **L4.** History starts at 2010-01-01, so there are no 2008–09 bars. This leads to A8, pending M0; the recommendation is labelling from each security's 500th session.
+- **L5.** Index members outside `current_symbols_V2` are never collected.
+- **L6.** No load time is written.
+- **L7.** The option-field semantics must be kept identical.
+- The local myFinData checkout is not the production copy (logs end 2024-06, config names `histdailyprice6`, no crontab here). **U0 finds the production host.**
+- The loader's raw CSV cache dates each symbol's first load exactly (local copy: 181/183 on 2023-04-26). This adds `security_master.mysql_first_load_date`, which turns §4.6.1's inference into a check.
+
+**Effort.** SR 44 → 46 h (M0 +0.5, M3 +0.5, M4 +1). The upstream track is ≈ 16 h in Fin-Lambda, in parallel and not gating P1.
+
+**Tests.** No code change; 59 offline tests unchanged. Planned additions:
+- `tests/integration/test_upstream_contract.py`;
+- `load_audit` `available_at` cases in `test_mysql_extract.py`;
+- the first-load override case in `test_split_state.py`;
+- the membership diff case in `test_universe.py`;
+- one pytest file per new Fin-Lambda Lambda, under that repo's rules.
+
+---
+
+## 2026-09-24 — P1 plan: MySQL loader is append-only (docs only)
+
+**Goal.** Use the owner's answer that the `histdailyprice7` loader only appends new days and never re-downloads history after a split.
+
+**Design consequences** (tech doc §4.6.1, §4.6.2, §4.6.7, §4.7; BUILD-PLAN §17.2 A2).
+
+- **Two segments per security.** The first-load backfill is rescaled for splits before the backfill date `b`; appended rows are traded prices. The split-state rule now also requires the append-only signature: applied splits all precede non-applied ones, and a violation is a `split_state` blocker. It records the bracket `b̂` in `security_master` (`mysql_backfill_lo/hi`).
+- **`AdjClose` is dropped entirely.** On appended rows it equals `Close`, so it carries no dividend information. Dividends come from actions only.
+- **Gate a's a2 diagnostic changed.** It now compares the MySQL-recovered traded close with the live-yfinance-recovered traded close: same vendor, independent reconstruction path. It runs monthly (≈ 800 calls). a1 (Tiingo) remains the gate.
+- **Restatements.** An overlap mismatch now means a manual edit or reload in MySQL, not a split; the security is re-extracted and the event logged.
+
+**Tests.** No code change. `test_split_state.py` fixtures redefined around the backfill boundary: all/none/some applied, ambiguous, non-monotone.
+
+---
+
+## 2026-09-24 — P1 plan: MySQL audit answers folded in (docs only)
+
+**Goal.** Record the owner's answers about the in-house data and the VPS, and adjust the P1 design to them.
+
+**Answers.**
+
+- Bars are in `histdailyprice7`: PK `(Date, Symbol, Exchange)`; `Open/High/Low/Close/Volume/AdjClose` as `FLOAT`.
+- Delisted names are kept up to the delisting date.
+- The source is yfinance, loaded every weeknight after the US close and before the HK/China open.
+- Options are in `OptionChains` (yfinance `option_chain()` layout), captured daily after the US close, for ≈ 50 US stocks/ETFs.
+- The VPS has 4 vCPU / 16 GB / 200 GB NVMe / 16 TB transfer.
+
+**Design consequences** (tech doc §4, BUILD-PLAN §17).
+
+- **Split state of the mirror.** Rows carry yfinance's split adjustment as of their load date, so a table can mix traded and rescaled rows. A new rule classifies every split from the stored jump across its ex-date as `applied`, not applied, or `ambiguous` (a DQ blocker), and recovers traded prices from that (§4.6.1). New planned test `test_split_state.py`.
+- **Independence.** MySQL is yfinance, so live yfinance is no longer a reconciliation source. Gate a rests on the Tiingo 50-name sample (a1). a2 becomes a consistency check against the table's own `AdjClose`. yfinance weekly work shrinks to split/dividend actions for listed names. Tiingo now also supplies actions for ≈ 350 delisted US names (one 30-day quota window).
+- **Precision.** MySQL `FLOAT` is cast exactly to `DOUBLE`. Strikes are rounded to 0.001 for stable keys.
+- **Restatements.** There is no `updated_at`, so the 40-session overlap check is the only detector. Per-security re-extracts are batched because `Symbol` is not a PK prefix.
+- **Options semantics** (§4.6.9):
+  - `available_at = close + 330 min` (conservative until the load-finish time is measured);
+  - `openInterest` → `open_interest_prev` (T-1);
+  - `iv_valid` and `quote_stale` flags;
+  - greeks computed later (FRED `DTB3` added to the series list);
+  - a Friday-close forecast sees Thursday's chain. Whether to move the options-using forecast is a P4 decision.
+- **Schedule.**
+  - nightly extract Mon–Fri 22:00 ET, freshness-gated to 23:30;
+  - weekly build Sat 06:00;
+  - watchdog daily 07:00 and Sat 09:00.
+- **Resources.** Options ≈ 1 GB per history-year, so 5 years of history is ≈ 6 GB in R2 (inside the free tier, $0). The whole lake fits on the VPS disk. The initial build is ≈ 1.5 h plus one ≈ 8 h Tiingo window. The estimate drops to ≈ 44 h; M0 shrinks to a 3 h residual audit (row counts, `Section` values, coverage, split-state spot checks, load-finish time, HK symbols).
+
+**Tests.** No code change. Planned additions in tech doc §4.7: `test_split_state.py`, `test_options_view.py`; `test_mysql_extract.py` extended with the concrete mapping, the cast and the freshness gate.
+
+---
+
+## 2026-09-24 — P1 plan revised after review: universe, existing infrastructure, options, yfinance adjustment (docs only)
+
+**Goal.** Apply the owner's review of the 2026-09-23 P1 plan:
+
+1. Change the universe to S&P 500, Nasdaq-100, DJIA and HSI.
+2. Use the existing resources: MySQL on DigitalOcean (market data), Cloudflare R2, AWS Serverless, a Hostinger VPS.
+3. Use the in-house daily OHLCV and daily options data.
+4. Reconsider A2, since "yfinance has both adjusted and unadjusted" prices.
+
+**Finding on (4).** Checked live and against the cached raw file. yfinance `history(auto_adjust=False)` returns `Close` split-adjusted and dividend-unadjusted, plus `Adj Close` fully adjusted. Neither is the traded price: AAPL 2020-08-28 `Close` = 124.81, while the traded close was ≈ $499 before the 2020-08-31 4:1 split. `back_adjust=False` and `repair=False` do not change this. A2 therefore stands, reworded precisely. If the in-house MySQL stores traded prices (M0 audit), they are used directly.
+
+**Documentation changes.**
+
+- `SR_Technical_Document.md` v0.3.
+  - §4 rewritten again:
+    - a deployment view: MySQL (read-only upstream) → VPS (ingest) → R2 (canonical lake + write-once raw) ← Lambda (EDGAR/FRED fetchers + watchdog) → workstation;
+    - `MySqlExtractor` (DuckDB `mysql` extension → immutable Parquet extracts), with the schema mapping in `config/sources.yaml`;
+    - the `ObjectStore`/`R2Store` layer;
+    - the spine chain `mysql → yfinance → tiingo → stooq_manual`;
+    - an M0 audit table of what must be learned about the MySQL data;
+    - `option_daily` as a view over the raw extracts, with an `available_at` rule (§4.6.9);
+    - HK specifics: curated typhoon/black-rain closures, bonus and rights-issue factors, HKEXnews delisting evidence;
+    - gate b reported per index;
+    - resources re-sized for ≈ 1 150 securities, with options storage given as scenarios;
+    - a VPS/Lambda/MySQL schedule;
+    - milestones M0–M8, ≈ 46 h.
+  - D1, D2, D4, D5, D6 and D9 amended.
+  - §2.1/§2.2/§2.5/§2.6, Appendix A (`option_daily`, `closure_reason`, action types, `index_name` values) and Appendix B updated.
+  - P4/P6 references to the CBOE archive replaced.
+- `BUILD-PLAN.md` v1.2: §17 rewritten (amendments A1–A6, resource table per host, schedule); §12 P1 universe line and §5.1 note amended.
+- `CLAUDE.md`: project state and standing decisions (data sources, universe) updated.
+
+**Deviations from BUILD-PLAN.**
+
+- The universe changes (A5, owner decision). Gate b's threshold is unchanged.
+- The estimate is ≈ 46 h (Weeks 2–4 against BP's Weeks 2–3).
+- The options module becomes a P4 candidate (A6); it is not built in P1.
+- The CBOE archive is dropped.
+
+**Tests.** No code change. The planned suites are updated in tech doc §4.7: new `test_mysql_extract`, `test_spine`, `test_objectstore`, `tests/unit/ops/test_lambdas.py`; HK closure and rights/bonus cases; an options leakage trap.
+
+---
+
+## 2026-09-23 — P1 implementation plan: resources, schedule, design amendments (docs only)
+
+**Goal.** Turn P1 (data spine) into an implementation plan with the resources it needs: database, Cloudflare R2, compute, and operating time. Record it in `docs/BUILD-PLAN.md` (new §17) and `docs/SR_Technical_Document.md` (§4 rewritten in place).
+
+**Findings that changed the design.**
+
+- *yfinance has no delisted history.* `XLNX`, `TWTR`, `ATVI` and `CELG` return 0 rows (live check, 2026-09-23). A survivorship-free universe is P1's kill criterion, so delisted names are backfilled from the Tiingo free tier. Its quota is 500 unique symbols/month, 50 req/h, 1 000 req/day and 1 GB/month (confirmed). One spine source per security, never spliced.
+- *Back-adjusted prices leak future splits.* yfinance history is split-adjusted through the fetch date. Used as-is, the round-number generator would build ladders on prices nobody traded at (AAPL ≈ $500 in 2020-08 shows as ≈ $125). P1 therefore reconstructs true unadjusted raw and adjusts as of the forecast date on read (`PointInTimeAdjuster`, tech doc §4.6.1). The old `bar_daily_adj.available_at = max(bar, action)` rule is dropped. That rule would have hidden all history before a later split. `bar_daily_adj` becomes `bar_daily_adj_latest`, a reconciliation-only view that `PITStore` cannot read.
+- *The curated universe file was under the git-ignored `data/`.* It moves to `curated/index_membership.csv` at the repo root.
+
+**Documentation changes.**
+
+- `BUILD-PLAN.md` v1.1:
+  - new §17: deliverables, amendments A1–A4, resources, time of operation, exit;
+  - amendment note on §5.1 (spine);
+  - pointer from §12 P1.
+- `SR_Technical_Document.md` v0.2:
+  - §4 rewritten. It covers architecture, initial and weekly flows, classes, sources, and resources §4.5.3–§4.5.6 (DuckDB sizing, R2 layout/cost/immutability, compute, run schedule). It also covers:
+    - the point-in-time adjustment formula;
+    - spine selection and gate a;
+    - DQ, which gains a `c_ohlc` component; `c_ca` weight goes from .20 to .15;
+    - universe curation and the quantified kill rule (S&P 500 coverage < 90 % in any year after the Week-7 tranche);
+    - incremental ingest with restatement detection;
+    - lake determinism;
+    - the test plan;
+    - milestones M0–M8 (≈ 38 h).
+  - D4 and D5 amended, D6 cross-referenced, new D9 (R2 as a write-once mirror, never a read path).
+  - §2.5, §2.6, ER diagram, Appendix A (`symbol_map`, `ingest_run`, `spine_source`, `evidence_grade`) and Appendix B updated.
+- Import-linter is dropped from the P1 deliverables, because `test_layering.py` already enforces the layer rule.
+
+**Deviations from BUILD-PLAN.** The P1 gates and kill criterion are unchanged. Full S&P 400 delisted coverage completes ≈ Week 7, not Week 3, because of the Tiingo quota. P2 starts on the S&P 500 point-in-time universe and reports coverage (BP §17.2 A3). R2 stays inside its free tier (10 GB-month) for ≈ 3–4 years. An 8 GB warning triggers a decision that would amend D1.
+
+**Tests.** No code change, so no tests were added or removed. The P1 plan announces the new suites (tech doc §4.7): `tests/unit/data/*`, `tests/leakage/test_pit.py`, `tests/determinism/test_lake_replay.py`, `tests/unit/ops/test_backup.py`, `tests/integration/test_recon_live.py`. It also extends `test_ingestion.py::test_cache_is_immutable_and_dated` to `.csv.gz` without weakening it.
+
+---
+
 ## 2026-09-23 — P0 regression run and first code commit
 
 **Goal.** Close P0 in version control: re-run the full regression suite on

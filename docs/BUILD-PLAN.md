@@ -1,6 +1,6 @@
 # Support & Resistance Agent — Finalized Build Plan
 
-**Version:** 1.0 (finalized)
+**Version:** 1.2 (finalized; §17 P1 execution plan added 23 September, revised 24 September 2026, upstream-collector amendments A7–A8 the same day)
 **Date:** 14 September 2026
 **Supersedes:** `docs/SR-Plan.md` (institutional proposal) and `docs/Support-Resistance-design-fixed.MD` (research spec) as the *execution* document. Both remain valid as reference catalogues.
 **Scope of this document:** what we build, in what order, with what data, and the tests that decide whether each piece survives.
@@ -182,7 +182,9 @@ The user requirement is "different data sources." The design principle: **every 
 | **CBOE daily options CSV** | Full chain snapshot incl. OI | Free download; OI is T-1. Sufficient for a Friday-close weekly GEX. |
 | **Exchange calendars** (`exchange_calendars` pkg) | Sessions, half-days, holidays | Never assume 5 calendar days = 5 sessions (design-fixed §46). |
 
-**Explicitly not relied upon:** `yfinance`. It is scraping an API Yahoo discontinued in 2017; endpoints change without notice and it is flagged unstable for 2026. Acceptable as a *convenience cross-check* in dev, never as the production spine or as a backtest source of truth.
+> **Amended 2026-09-18 / 09-23 / 09-24 (see §17.2 A1, A6):** the price spine is chosen per security: in-house MySQL → yfinance → Tiingo (US) → Stooq manual. In-house daily options history replaces the CBOE snapshot. The paragraph below is the original 14 Sep position, kept for the record.
+
+**Explicitly not relied upon (superseded, §17.2):** `yfinance`. It is scraping an API Yahoo discontinued in 2017; endpoints change without notice and it is flagged unstable for 2026. Acceptable as a *convenience cross-check* in dev, never as the production spine or as a backtest source of truth.
 
 ### 5.2 Tier 1 — ~$10–30/mo, strongly recommended (unlocks P2)
 
@@ -456,9 +458,10 @@ One ticker, daily bars only, swing + round-number generators, naive clustering, 
 **Purpose:** validate the shape of the pipeline before investing in any of it. **Gate:** it runs. **Kill:** none.
 
 ### P1 — Data spine (Weeks 2–3)
-Point-in-time store, `event_ts` + `available_at` on every row, corporate actions (raw preserved separately from adjusted, per design-fixed §44), exchange calendars, **point-in-time universe reconstruction including delisted names**, DQ scoring. Universe: S&P 500 + S&P 400 members as of each historical date, 2010→present.
+Point-in-time store, `event_ts` + `available_at` on every row, corporate actions (raw preserved separately from adjusted, per design-fixed §44), exchange calendars, **point-in-time universe reconstruction including delisted names**, DQ scoring. Universe: ~~S&P 500 + S&P 400~~ **S&P 500, Nasdaq-100, DJIA and Hang Seng Index** members as of each historical date, 2010→present *(amended 2026-09-24, §17.2 A5)*.
 **Gate:** (a) adjusted closes reconcile against a second source within tolerance on a 50-ticker × 200-date sample; (b) the 2015 universe contains companies that no longer exist; (c) the leakage test suite passes on all features defined so far.
 **Kill:** cannot assemble a survivorship-free universe → descope to a smaller curated universe with hand-verified delistings; do not proceed with a survivorship-biased one.
+**Execution plan, resources and schedule:** §17.
 
 ### P2 — Levels, labels, and the matched-control gate (Weeks 4–6)
 All Tier-0 generators (families A–F), ATR-space HDBSCAN, zone identity + state machine, triple-barrier labels, the full level-reaction database, and the §7.3 matched-control experiment.
@@ -547,6 +550,92 @@ Adapted from design-fixed §90, made measurable:
 3. Stand up `research/trials.jsonl` and the leakage test harness **before** the first model is fit. Both are worthless if added later.
 4. Build the P1 point-in-time universe, including delisted names, 2010→present.
 5. Run the §7.3 matched-control experiment as soon as P2 labels exist. Do not write a model before that table exists.
+
+---
+
+## 17. P1 execution plan — resources, schedule, amendments
+
+*Added 23 September 2026 and revised 24 September 2026 after review and the owner's answers on the MySQL data. The design (classes, flows, formulas, tests) is `SR_Technical_Document.md` §4. This section fixes what P1 consumes, where it runs and when. P1's gate thresholds and kill criterion (§12 P1) are unchanged. The universe they apply to is amended (A5).*
+
+### 17.1 What P1 delivers
+
+- A point-in-time data spine for the members of **S&P 500, Nasdaq-100, Dow Jones Industrial Average (US) and Hang Seng Index (HK)** as of each date, 2010→present, **including delisted names**. That is ≈ 1 150 securities: ≈ 1 020 US, ≈ 130 HK. These are estimates; the M0 audit measures them.
+- Daily bars from 2008, so the 500-session lookback is full on 2010-01-01. The start date is `.env` configuration, and names delisted before the 2008 prepend follow the coverage rule in A8.
+- The in-house **daily options** history (≈ 50 US stocks/ETFs, yfinance option chains captured after each US close), landed point-in-time.
+- Corporate actions (incl. HK bonus and rights issues), EDGAR filing index (US), FRED macro vintages, a DQ score per security per Friday.
+- A single read API (`PITStore`) that cannot return a row with `available_at > as_of`.
+
+Modelling order is unchanged: P2–P3 are US, and HK remains the P4 generalisation test. Its data simply exists from P1.
+
+### 17.2 Amendments to earlier sections
+
+| # | Amends | Change | Why |
+|---|---|---|---|
+| A1 | §5.1 spine | **Spine chosen per security: in-house MySQL → yfinance → Tiingo (US) → Stooq manual.** One source per security, never spliced. yfinance supplies split/dividend actions for listed names; Tiingo supplies them for delisted US names. | The owner's MySQL (`histdailyprice7`) already holds daily OHLCV. It is a yfinance mirror that keeps delisted names up to their delisting date, which makes it the survivorship defence. yfinance returns **0 rows** for delisted names (XLNX, TWTR, ATVI, CELG, checked 2026-09-23). Tiingo's free tier keeps delisted US history but allows 500 symbols/month. |
+| A2 | §12 P1 corporate actions | Store **traded (unadjusted)** prices and adjust **as of the forecast date** on read. | yfinance offers `Close` (split-adjusted, dividend-unadjusted) and `Adj Close` (split- and dividend-adjusted), but **no traded-price series**: AAPL on 2020-08-28 shows `Close` 124.81 against ≈ $499 traded (before the 4:1 split). Round-number levels (§6.2 family B) built on such prices are leakage. The MySQL mirror is **append-only**. Each stock's first-load backfill is rescaled for splits before that load, and every later row is the traded price. The boundary is inferred from the split jumps and traded prices are recovered (tech doc §4.6.1). |
+| A3 | §12 P1 schedule | Estimated ≈ 47 h ≈ **Weeks 2–4**, about half a week over, plus ≈ 24 h of non-gating upstream work in Fin-Lambda (A7). | HK data and the four-host deployment are added; S&P 400 curation and the second Tiingo tranche of the earlier draft are removed. |
+| A4 | §11 stack / §1.2 hardware | P1 runs on the **existing infrastructure**: MySQL (DigitalOcean) as upstream system of record, **Hostinger VPS** as ingest host, **Cloudflare R2** as canonical lake + write-once raw archive, **AWS Lambda** for stateless fetchers and an independent watchdog. The workstation does research. | Uses what is already paid for. Nothing new is bought. |
+| A5 | §0, §12 P1 universe | ~~S&P 500 + S&P 400~~ → **S&P 500, Nasdaq-100, DJIA, Hang Seng Index**. Gate b's threshold (≥ 60 departed 2015 S&P 500 members) stays; NDX/DJIA/HSI counts are reported. The kill criterion applies per index. | Owner decision, 2026-09-24. |
+| A6 | §5.1, §15 budget, §12 P4 | **Daily options history exists (in-house, ≈ 50 US underlyings, no greeks, prior-day open interest).** P1 lands it point-in-time. The options/GEX module (family G) becomes a *candidate* P4 enrichment, still admitted only through §8 rung 7. The CBOE snapshot archive is dropped. | Owner data, 2026-09-24. |
+| A7 | §11 stack, §15 | **Two repositories.** `Fin-Lambda` owns every job that writes the owner's MySQL and **absorbs myFinData's two cron jobs** (`eoddata_ext.sh` 21:10 and `optchain-PM.sh` 21:40). They are ported to Lambdas `eodDaily` and `optChainEOD`, verified by a 10-session shadow run, then cut over, and myFinData is archived. This repository reads MySQL read-only. The contract is data (tables and semantics), not code (tech doc §4.5.7, D10). | The two jobs run as host-local cron with an unpinned yfinance `auto_adjust` and swallowed errors, and they write no load time. Porting fixes these for every row written after the cutover without touching history. The upstream track (≈ 24 h, including sharding for the 15-min Lambda limit and a daily status report) runs in parallel and **does not gate P1**. |
+| A8 | §17.1 bars from 2008 | **History starts 2008-01-01, set in `.env`** (owner, 2026-09-24): `FIRSTTRAINDTE="2008/01/01"` in Fin-Lambda and `SR_HISTORY_START=2008-01-01` here. The MySQL loader had started every symbol on 2010-01-01. A one-off prepend run (tech doc §4.5.7 U2b) adds 2008–09 for listed symbols without changing any existing row. The split recovery uses each row's exact load date (tech doc §4.6.1). **Names delisted before the prepend cannot get 2008–09 from yfinance**, so for them: a security enters labelling at its 500th lake session. A 2010 or 2011 index-year enters evaluation only if ≥ 90 % of that year's members have a full 500-session lookback; otherwise that index's evaluation starts in 2012. M8 reports the percentages. Tiingo 2008–09 bars for delisted US names would lift coverage but would be a splice (A1), so they are not used. | The loader's `FIRSTTRAINDTE` was 2010-01-01 (tech doc §4.5.7 L4). Without the coverage rule, 2010–11 would be evaluated mostly on survivors, the bias gate b exists to catch. |
+
+### 17.3 Required resources
+
+| Resource | Role in P1 | Requirement | Cost |
+|---|---|---|---|
+| **MySQL, DigitalOcean** (existing) | Upstream system of record: `histdailyprice7` (daily OHLCV, US + HK) and `OptionChains` (daily options). **Read-only**: data is copied out as immutable extracts; backtests never query it. | Read-only user `sr_reader`; VPS IP in *Trusted Sources*; TLS. Both tables lead their PK with `Date`, so nightly range queries are cheap. Load: one off-peak bulk extract, then two small queries per night after the owner's load. | none added |
+| **Cloudflare R2** (existing) | **Canonical Parquet lake** + write-once raw archive + run manifests; hand-off between VPS, Lambda, workstation. | Bucket `sr-agent`; two bucket-scoped tokens (VPS read/write; Lambda + workstation limited). | Lake excluding options ≈ 1 GB; options ≈ 1 GB per history-year (≈ 50 underlyings). With 5 years of options history ≈ 6 GB, **inside the 10 GB free tier: $0**. Operations ≪ free tier. |
+| **Hostinger VPS** (existing) | All scheduled, stateful ingest: MySQL extracts, yfinance, Tiingo, lake build, adjustment, DQ, R2 upload. | The owner's VPS: **4 vCPU / 16 GB / 200 GB NVMe / 16 TB transfer**, more than P1 needs. It holds the whole lake locally, with room for P6's scheduled forecast. Static IP, Ubuntu, `uv`, systemd timers. | none added |
+| **AWS Serverless** (existing) | 3 SR Lambdas: EDGAR daily index, FRED vintages, and a **watchdog** that alerts (SNS email) when the VPS misses a run. EventBridge Scheduler; secrets in SSM. Upstream (A7): 3 new Fin-Lambda functions, `eodDaily`, `optChainEOD` and `statusReport`, in the existing `fin-cron-data` stack on a python3.13 layer. | SR: container image, arm64, 512 MB, ≈ 70 invocations/month. Fin-Lambda: 15-min limit per invocation, so jobs run as shards + sweep (options: 3 shards); ≈ 200 invocations/month. | $0 (inside the free tier) |
+| **Database engine** | DuckDB (embedded) over Parquet on every host; reads MySQL, local disk and R2 with one engine. | `duckdb` + `mysql` / `httpfs` extensions, pinned. | $0 |
+| **Workstation** | Development and tests in P1; research compute from P2. | Unchanged. The disk is 87 % full (60 GB free), so pull the options history selectively. | — |
+| **External accounts** | Tiingo token, FRED key, SEC contact string (User-Agent). | Free. | $0 |
+
+### 17.4 Time of operation
+
+**Build effort ≈ 47 h** in this repository, **+ ≈ 24 h** for the upstream track in Fin-Lambda (A7), which runs in parallel:
+
+| Milestone | Hours |
+|---|---|
+| Residual MySQL/infra audit, incl. the production host of the cron jobs | 3.5 |
+| Infrastructure set-up | 4 |
+| Storage layer | 5 |
+| Universe curation for 4 indexes | **10.5, the long pole** |
+| Price and options ingestion, incl. `load_audit` and the loader-cache import | 9 |
+| Corporate actions + reconciliation | 5 |
+| DQ + Lambdas + timers | 4 |
+| Leakage suite + `sr status` | 4 |
+| Gate run | 2 |
+| *Upstream track (Fin-Lambda): layer, 2 sharded ports, 2008 prepend, tables, shadow run, cutover, archive, DJIA/HSI membership, status report* | *24, not gating* |
+
+**Initial data build:** ≈ 1.5 h on the VPS, plus one unattended ≈ 8 h Tiingo window (split/dividend actions for ≈ 350 delisted US names + the reconciliation sample).
+
+**Recurring jobs** (America/New_York):
+
+| Job | Host | When | Runs for |
+|---|---|---|---|
+| Upstream `eodDaily` (bars + actions → MySQL) | Lambda (Fin-Lambda) | Mon–Fri 18:30, after cutover (shards 3 min apart if needed, sweep +30 min); replaces cron `10 21 * * 1-5` | < 15 min per shard |
+| Upstream `optChainEOD` (options → MySQL) | Lambda (Fin-Lambda) | Mon–Fri, 3 shards 3 min apart + a sweep 30 min later, starting at the current PM job's time converted to ET (U0); replaces cron `40 21 * * 1-5` | ≈ 3–7 min per shard (< 15 min limit) |
+| Upstream `statusReport` (DataName, last data date, last run date/time, status, symbols, rows) | Lambda (Fin-Lambda) | Mon–Fri 20:00, e-mail + R2 `status/latest.json` | seconds |
+| Nightly MySQL extract (bars + options, US + HK) | VPS | Mon–Fri 22:00, after the owner's load; waits for fresh data until 23:30. After cutover it starts on the `load_audit` signal (≈ 18:45) and 22:00 becomes the fallback | ≈ 5 min |
+| Weekly build: actions, universe, adjust, DQ, checks, manifest | VPS | Sat 06:00 | ≈ 20 min |
+| EDGAR daily index | Lambda | Mon–Fri 22:30 | < 1 min |
+| FRED vintages | Lambda | Mon–Fri 17:30 | < 1 min |
+| Watchdog | Lambda | daily 07:00 + Sat 09:00 | seconds |
+| Reconciliation refresh (Tiingo, 50 names) | VPS | 1st Saturday monthly | ≈ 1 h |
+| Index membership update | manual, prompted by `portAssetsHandler`'s daily change detection | on each S&P/DJIA announcement, NDX annual reconstitution, HSI quarterly review | ≈ 1 h |
+| R2 restore drill | VPS | quarterly | ≈ 15 min |
+
+### 17.5 Exit
+
+P1 is done when:
+
+- gates a, b and c pass as tests (tech doc §4.7) and are recorded in `HISTORY.md`;
+- the nightly and weekly jobs have run unattended with the watchdog green;
+- one restore from R2 has rebuilt the lake byte-for-byte.
+
+A coverage below 90 % for any index in any year 2010–2025 triggers the §12 P1 descope for that index.
 
 ---
 
