@@ -220,3 +220,4 @@ __marimo__/
 # SR-Agent: raw cache, lake and experiment tracking (SR_Technical_Document §2.6)
 data/
 mlruns/
+!src/sr_agent/data/
