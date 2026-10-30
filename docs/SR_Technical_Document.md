@@ -1,7 +1,7 @@
 # Support & Resistance Agent — Technical Design Document
 
-**Version:** 0.4 (P0 built; P1 implementation plan, revised, with the upstream-collector migration; P2–P4 designed; P5–P6 provisional)
-**Date:** 24 September 2026
+**Version:** 0.5 (**P1 re-planned 2026-10-29**: storage on Fin-Lambda's MySQL, R2 = events only, VPS/Lambda/SR-lake dropped, Fin-Lambda `fin-deep-data` confirmed as the live upstream; P0 built; P2–P4 designed; P5–P6 provisional)
+**Date:** 29 October 2026
 **Companion to:** [`BUILD-PLAN.md`](BUILD-PLAN.md) (what we build, in what order, with what gates). This document is the *how*: for every phase it fixes the architecture, the data/work flow, the classes and layers, the data sources and storage, and the algorithms and formulas an implementer needs. Where the two disagree, BUILD-PLAN's gates and constants win and this document is wrong.
 **Reference catalogues:** [`Support-Resistance-design-fixed.MD`](Support-Resistance-design-fixed.MD) (label definitions §6–7, §16; state machine §63; schema §48) and [`SR-Plan.md`](SR-Plan.md) (volume profile §1.1, KDE/GMM/Camarilla §3).
 
@@ -33,14 +33,14 @@
 
 | # | Decision | Consequence for the design |
 |---|---|---|
-| D1 | **No new data purchases; existing in-house data and infrastructure are used** (BP §5.1, §15; amended 2026-09-24). | Tier-0 public sources plus the owner's existing **MySQL market data (daily OHLCV and daily options)**, Cloudflare R2, AWS Serverless and a Hostinger VPS (§4.2, §4.5). Intraday bars, off-exchange prints and minute-level volume profile are **not built**; the product is a **daily-bar forecaster**. With daily options history now available, family G (options/GEX) becomes a *candidate* P4 enrichment module, still admitted only through the BP §8 rung-7 ablation gate; P1 lands the options data point-in-time and nothing consumes it yet. Slots for unavailable sources keep `*_available = 0` (BP §5, design-fixed §76). The CBOE snapshot archive of the earlier draft is dropped. |
+| D1 | **No new data purchases; existing in-house data and infrastructure are used** (BP §5.1, §15; amended 2026-09-24, **2026-10-29**: the infrastructure is Fin-Lambda's MySQL as canonical store + R2 events + this box; the VPS and SR-side AWS of the 09-24 reading are dropped). | Tier-0 public sources plus the owner's **MySQL market data (daily OHLCV, daily options, 15-min bars, FX, rates, FFF — collector: Fin-Lambda `Ops/fin-deep-data`)** and Cloudflare R2 for events (§4.2, §4.5). Intraday bars, off-exchange prints and minute-level volume profile are **not built**; the product is a **daily-bar forecaster**. With daily options history now available, family G (options/GEX) becomes a *candidate* P4 enrichment module, still admitted only through the BP §8 rung-7 ablation gate; P1 lands the options data point-in-time and nothing consumes it yet. Slots for unavailable sources keep `*_available = 0` (BP §5, design-fixed §76). The CBOE snapshot archive of the earlier draft is dropped. |
 | D2 | **US first, HK second** for modelling, other markets deferred (BP §1.2, §15). | Universe (amended 2026-09-24): **S&P 500, Nasdaq-100, DJIA** (US) and **Hang Seng Index** (HK), point-in-time, 2010→. P1 builds data for both markets; P2–P3 model US; HK is the P4 generalisation test. China A-share price-limit truncation is a hook in the MC engine (§6.6.6), inactive. |
 | D3 | **Horizon H = 5 local sessions** (BP §3, design-fixed §3). | Session arithmetic goes through `exchange_calendars` everywhere; never calendar days. |
 | D4 | **Price spine chosen per security: in-house MySQL → yfinance → Tiingo (US) → Stooq manual**, never spliced within a security (§4.6.2). *History:* Stooq was the spine until 2026-09-18 (browser proof-of-work); yfinance was the spine for P0; the in-house MySQL data was added 2026-09-24. | yfinance returns **no history for delisted names** (XLNX, TWTR, ATVI, CELG: 0 rows, 2026-09-23). Its `Close` is split-adjusted and dividend-unadjusted, and its `Adj Close` is fully adjusted; **there is no traded-price series** (AAPL 2020-08-28: `Close` 124.81 vs. ≈ $499 traded). P1 therefore stores traded prices, reconstructing them from split events where a source serves adjusted prices, and adjusts point-in-time on read (§4.6.1). The in-house MySQL (`histdailyprice7`) is itself a yfinance mirror that keeps delisted names up to their delisting date, loaded row by row over time, so its split state is detected per split (§4.6.1). yfinance supplies split/dividend actions for listed names. Tiingo (free tier, 500 symbols/30 days) supplies them for delisted US names, fills US gaps, and provides the only independent source: the 50-name reconciliation sample. |
 | D5 | **Point-in-time universe from hand-curated membership files** in git (`curated/index_membership.csv`), drafted from pinned Wikipedia revisions and verified against index-provider notices (S&P DJI, Nasdaq, Hang Seng Indexes) plus EDGAR / HKEXnews delisting evidence. | This is the P1 kill-criterion risk (BP §12 P1). §4.6.4 defines "cannot assemble" per index and the descope path. |
-| D6 | **Point-in-time store = DuckDB over Parquet; the in-house MySQL stays the upstream system of record** (BP §1.2, §11; amended 2026-09-24). | Backtests never query MySQL: its rows are mutable and carry no `available_at`, and walk-forward scans are columnar work. Data is copied out as immutable extracts, and the lake is built from those. `sr.duckdb` holds catalogue views plus small tables that are rebuilt deterministically from `curated/`. Sizing and settings: §4.5.3. |
-| D9 | **Cloudflare R2 = canonical lake + write-once raw archive; ingest runs on the Hostinger VPS; AWS Lambda runs stateless fetchers and an independent watchdog** (added 2026-09-23, revised 2026-09-24). | R2 is the hand-off point between hosts. Free egress makes research pulls free. Storage beyond the 10 GB free tier costs cents a month, driven by the options history (§4.5.4). Lambda never connects to MySQL or Yahoo (§4.2). |
-| D10 | **Two repositories, split by who writes MySQL** (added 2026-09-24). | `Fin-Lambda` is the upstream collector: every job that writes the owner's market-data MySQL, including myFinData's two cron jobs, which it absorbs. This repository is the point-in-time spine and everything above it: it reads MySQL read-only and writes only its own R2 bucket. The contract is data (tables and semantics), not code. Code is ported, never imported (§4.5.7). |
+| D6 | **Point-in-time read path: MySQL stays the canonical store (owner, 2026-10-29); SR keeps immutable local raw extracts plus a deterministic DuckDB/Parquet compute cache; R2 holds events only** (BP §1.2, §11; amended 2026-09-24, storage amended 2026-10-29). | Backtests never query MySQL live: walk-forward scans run on the local cache, rebuilt deterministically from immutable extracts, so replay determinism and the leakage rules keep their original form. `available_at` for rows written after the Fin-Lambda `eodDaily`/`optChainEOD` deployment is exact (`load_audit.finished_at`); earlier rows use the §4.6.1 inference. The R2 canonical lake, the Hostinger VPS ingest host and the SR EDGAR/FRED/watchdog Lambdas of the 2026-09-24 design are **dropped** (BP §17.2 A9); EDGAR/FRED fetchers run on this box and write the R2 `events/` prefix. Sizing and settings: §4.5.3. |
+| D9 | **Cloudflare R2 = events archive (news/EDGAR/FRED); NOT a data lake** (added 2026-09-23; **repurposed 2026-10-29, owner decision**: Fin-Lambda's MySQL is the canonical store for market data, R2 only for news/events and Fin-Lambda's own raw collector cache). | The SR-side R2 lake, the Hostinger VPS ingest host and the SR Lambdas are dropped (§4.5.4 rev.). SR's R2 use is a small `events/` prefix written by the EDGAR/FRED fetchers on this box. Lambda (Fin-Lambda side) never connects to MySQL from SR's perspective — irrelevant now that SR runs no Lambdas. |
+| D10 | **Two repositories, split by who writes MySQL** (added 2026-09-24; **upstream collector confirmed 2026-10-29: `Ops/fin-deep-data` is the live service** — all ten functions ported to python3.13, shadow run on `*_shadow` tables since 2026-10-06, `fin-cron-data` frozen for retirement at cutover). | `Fin-Lambda` is the upstream collector: every job that writes the owner's market-data MySQL. This repository is the point-in-time read path and everything above it: it reads MySQL read-only and writes only the R2 `events/` prefix. The contract is data (tables and semantics), not code. Code is ported, never imported (§4.5.7). |
 | D7 | **LightGBM is the production model; deep learning is a challenger** (BP §8). | P5's sequence model ships only if it beats LightGBM out-of-sample with CI excluding zero. |
 | D8 | **The LLM never emits a number** (BP §4). | Every numeric field in a forecast is produced by the deterministic core; the verifier (§7.6.2) machine-checks the narrative. |
 
@@ -75,19 +75,20 @@ flowchart TB
         VAL -.-> MODELS
     end
 
-    subgraph STORE["STORAGE — Parquet lake + DuckDB catalogue"]
-        LAKE[("lake/*.parquet on R2 (local cache)<br/>raw · levels · features · labels")]
+    subgraph STORE["STORAGE — MySQL (canonical, Fin-Lambda) + local Parquet cache"]
+        MYSQLC[("MySQL GlobalMarketData/Trading<br/>CANONICAL market data<br/>(collector: Fin-Lambda fin-deep-data)")]
+        LAKE[("data/lake/*.parquet + data/raw/<br/>immutable extracts · levels · features · labels<br/>(rebuildable cache, this box)")]
         DUCK[("data/sr.duckdb<br/>catalogue views · forecast store · registry")]
         TRIALS[("research/trials.jsonl<br/>every configuration evaluated")]
         MLF[("mlruns/ (MLflow)<br/>model registry")]
     end
 
     subgraph SRC["TIER-0 DATA SOURCES (free)"]
-        MYSQLS["In-house MySQL: daily OHLCV + options (US, HK)"]
+        MYSQLS["Fin-Lambda → MySQL: daily OHLCV + options (US, HK)<br/>load_audit · corp_action_daily"]
         STOOQ["yfinance actions · reference · fallback bars"]
         TIINGO["Tiingo free tier (US gaps · reconciliation)"]
-        EDGAR["SEC EDGAR filings + timestamps"]
-        FRED["FRED macro series"]
+        EDGAR["SEC EDGAR filings + timestamps → R2 events/"]
+        FRED["FRED macro series → R2 events/"]
         XCAL["exchange_calendars"]
     end
 
@@ -136,12 +137,12 @@ sr_agent/
 ├─ agent/             loop.py · prompts/ · verifier.py · mcp_server.py · extract.py        P4
 ├─ api/               main.py                                                              P4
 ├─ reporting/         render.py · dashboard.py · score.py · drift.py                       P4 render · P6 rest
-├─ ops/               lambdas.py · systemd/ (VPS timers)                                   P1
+├─ ops/               schedules.py (cron definitions) · watchdog                      P1
 │                     flows.py (Prefect)                                                   P6
 ├─ research/          notebooks/ · trials.jsonl · rejected.md                              P2
 ├─ cli.py             `sr p0 AAPL` · `sr ingest` · `sr forecast` …                         P0
 └─ tests/             unit/ · leakage/ · determinism/ · guardrails/                        P1
-data/                 raw/ · lake/ · sr.duckdb            (git-ignored)                    P0 raw · P1 lake
+data/                 raw/ · lake/ · sr.duckdb            (git-ignored)                    P0 raw · P1 cache
 ```
 
 Layer discipline (enforced by import-linter in CI from P1):
@@ -198,7 +199,7 @@ All sources are free. Every source is optional at forecast time; missing sources
 | **Tiingo (free tier)** | Daily OHLCV + adjusted close, split/dividend factors: (1) **spine for delisted names** (P1 amendment, D4), (2) the reconciliation sample and CA cross-check | REST `https://api.tiingo.com/tiingo/daily/{ticker}/prices`, token | Free-tier caps (verify at sign-up; treat as hard limits in `markets.yaml`): 50 req/hr, 1 000 req/day, 500 unique symbols/month, 1 GB/month bandwidth (confirmed 2026-09-23). Enough for 50 tickers × 200 dates plus ≈ 450 delisted names per 30 days (`QuotaLedger`, §4.4). | `bar_daily_ref`, `corporate_action` (source=`tiingo`) | P1 |
 | **SEC EDGAR** | Filing index with acceptance timestamps (8-K, 10-Q, 10-K, Form 25, Form 15), full text for extraction | `https://data.sec.gov/submissions/CIK##########.json`; full-text search `https://efts.sec.gov/LATEST/search-index?q=…`; documents from `https://www.sec.gov/Archives/` | Descriptive `User-Agent: SR-Agent <email>`; ≤ 10 req/s; no key. Acceptance datetime is `available_at`. | `filing`, `document` | P1 (index), P4 (text) |
 | **FRED** | Macro series (DGS10, DFF, VIXCLS, …) and the release calendar | `https://api.stlouisfed.org/fred/series/observations`, free key; `fred/releases/dates` | Unlimited for our volume. Use *vintage* (ALFRED) endpoints for revised series so `available_at` is the release date. | `macro_series`, `macro_release` | P1 |
-| **In-house MySQL (DigitalOcean)** | Daily OHLCV (US, HK) and daily options prices | DuckDB `mysql` extension, read-only user `sr_reader`, TLS, VPS IP allow-listed | Coverage, adjustment convention, delisted rows, history depth, load time and vendor are established by the P1 M0 audit (§4.5.1). Mutable upstream: copied out as immutable extracts, never queried by backtests (D6). | `bar_daily_raw` (source=`mysql`), `option_daily` | P1 |
+| **In-house MySQL (DigitalOcean)** | Daily OHLCV (US, HK), daily options prices, 15-min bars, FX, rates, FFF; **collector = Fin-Lambda `Ops/fin-deep-data` (live)** | DuckDB `mysql` extension, read-only user `sr_reader`, TLS, this box's IP allow-listed | Coverage, adjustment convention, delisted rows, history depth, load time and vendor are established by the P1 M0 audit (§4.5.1). Mutable upstream + no universal `available_at`: copied out as immutable extracts, never queried by backtests (D6). `load_audit.finished_at` gives exact `available_at` for rows the shadow run (2026-10-06 →) and later write. | `bar_daily_raw` (source=`mysql`), `option_daily` | P1 |
 | **`exchange_calendars`** | Sessions, holidays, half-days for XNYS, XHKG (XSHG/XSHE for the inactive limit hook) | Python package | Pin the version; sessions are computed, not stored, but a materialised `session_calendar` table exists for SQL joins. | `session_calendar` | P0 |
 | **Index membership (curated)** | Point-in-time S&P 500 / Nasdaq-100 / DJIA / Hang Seng membership intervals | `curated/index_membership.csv` (git-tracked, repo root), drafted from pinned Wikipedia revisions by `sr universe draft` and verified by hand from published change histories (pinned Wikipedia revisions of the S&P 500, Nasdaq-100, DJIA and HSI change tables; S&P Dow Jones Indices press releases; Nasdaq index notices; Hang Seng Indexes quarterly review results), one source URL per row | This is the survivorship-bias defence (BP §12 P1). Rows: `(index, ticker_at_time, security_id, cik_or_hkex_code, start_date, end_date, source_url, evidence_grade)`. Companion files: `curated/exchange_closures.csv` (HK typhoon/black-rain closures), `curated/corporate_actions_manual.csv` (HK rights/bonus issues missing from yfinance). | `universe_membership` | P1 |
 | **EDGAR Form 25 / Form 15** | Delisting / deregistration evidence with dates, to close membership intervals and mark `security_master.delisting_date` | EDGAR full-text search on form type | Free; the only free authoritative delisting record. | `security_master`, `corporate_action` (type=`delist`) | P1 |
@@ -226,9 +227,9 @@ research/trials.jsonl          append-only experiment log
 mlruns/                        MLflow tracking + model registry
 ```
 
-Hosts: `data/` above is the **local cache** on the VPS or workstation. The canonical copies of `raw/` (write-once) and `lake/` live in Cloudflare R2 bucket `sr-agent`, which also holds `manifests/` (D9, §4.5.4). `PITStore` reads either the local lake or `r2://sr-agent/lake`.
+Hosts: `data/` above is local to **this box** (ingest + research host). **Canonical market data is Fin-Lambda's MySQL** (owner decision, 2026-10-29): `data/raw/` holds the immutable extracts taken from it, and `data/lake/` (the compute cache) is a deterministic function of `raw/` + `curated/` — both rebuildable, neither canonical. Cloudflare R2 holds **events only** (`events/{edgar,fred}/`, news at P4) plus Fin-Lambda's own raw collector cache (D9, §4.5.4). There is no `manifests/` sync and no `r2://` lake path.
 
-Rules: raw data is never overwritten (design-fixed §44); lake datasets are rewritten per partition by idempotent jobs keyed on `(source, as_of)`; every table carries `event_ts` and `available_at` (BP §7.4); DuckDB is the only query engine and `PITStore` the only read API (§4.4).
+Rules: raw data is never overwritten (design-fixed §44); cache datasets are rewritten per partition by idempotent jobs keyed on `(source, as_of)`; every table carries `event_ts` and `available_at` (BP §7.4); DuckDB is the only query engine and `PITStore` the only read API (§4.4).
 
 **Entity model.** Each entity is tagged with the phase that introduces it. Full DDL is in Appendix A.
 
@@ -645,12 +646,14 @@ which is exactly the touch definition in §2.4 applied to simulated bars. This e
 
 ## 4. P1 — Data spine (Weeks 2–3)
 
-*Implementation plan; revised 2026-09-24 after review. Changes from the 2026-09-23 draft:*
+*Implementation plan; revised 2026-09-24 after review; **re-planned 2026-10-29** after the Fin-Lambda review and the owner's storage decision. Changes from the 2026-09-24 draft:*
 
-- *The **universe** is now S&P 500, Nasdaq-100, Dow Jones Industrial Average and Hang Seng Index. S&P 400 is dropped and HK data moves into P1.*
-- *The plan runs on the **existing infrastructure**: MySQL on DigitalOcean (the in-house daily OHLCV and daily options data), Cloudflare R2, AWS Serverless and a Hostinger VPS (§4.5.3–§4.5.6).*
+- ***Storage decision (owner, 2026-10-29):* Fin-Lambda's MySQL (`GlobalMarketData`/`Trading`) is the **canonical store** for market data. The Cloudflare R2 **canonical lake is dropped**; R2 now holds **news/events only** (plus Fin-Lambda's own raw collector cache). The Hostinger VPS ingest host and the three SR Lambdas (EDGAR, FRED, watchdog) are **dropped**: EDGAR/FRED fetchers run on this box and write the R2 `events/` prefix. The point-in-time machinery (immutable raw extracts, `AsOfQuery`/`PITStore`, adjust-on-read, DQ, leakage suite) is **unchanged** — only where the bytes live changed. See §4.5.3 rev and BP §17.2 A9 (to be added).*
+- ***Upstream confirmed (owner, 2026-10-29):* `Fin-Lambda/Ops/fin-deep-data` is the live collector service — all ten functions on python3.13 (migration complete 2026-10-14), the `eodDaily`/`optChainEOD`/`statusReport` shadow run writing `*_shadow` tables since 2026-10-06 with exact `load_audit.finished_at` timestamps, and `corp_action_daily` flowing. The upstream track of the 2026-09-24 plan (U0–U10) is **done or owner-run**; what remains is cutover (U6), the 2008 prepend (U2b) and the archive (U7), per Fin-Lambda's runbooks. §4.5.7 records the as-built state.*
+- *Scope re-cut: Stage A lands the **PIT read layer + SP500/NDX100/DJIA universe** (HSI data defers to P4 with modelling). Options history lands here (storage only; family G modelling stays P4-gated).*
+- *The **universe** is S&P 500, Nasdaq-100, Dow Jones Industrial Average and Hang Seng Index. S&P 400 is dropped and HK data moves into P4.*
 - *In-house **daily options prices** are landed point-in-time in P1 and replace the CBOE archive.*
-- *The owner answered most of the M0 audit on 2026-09-24 (§4.5.1). Bars come from `histdailyprice7` and options from `OptionChains`. Both are **yfinance mirrors**, loaded every weeknight after the US close and before the HK open. Delisted prices are kept up to the delisting date. Options cover ≈ 50 US stocks/ETFs. The VPS has 4 vCPU / 16 GB / 200 GB NVMe.*
+- *The owner answered most of the M0 audit on 2026-09-24 (§4.5.1). Bars come from `histdailyprice7` and options from `OptionChains`. Both are **yfinance mirrors**, loaded every weeknight after the US close and before the HK open. Delisted prices are kept up to the delisting date. Options cover ≈ 50 US stocks/ETFs within the 857-symbol V4 list.*
 
 *Two findings still stand:*
 
@@ -665,12 +668,12 @@ which is exactly the touch definition in §2.4 applied to simulated bars. This e
 
 "Done" means:
 
-1. `sr ingest --full` builds the lake from nothing, and `sr lake rebuild` rebuilds it byte-for-byte from the immutable raw extracts alone.
+1. `sr ingest --full` builds the local cache from nothing, and `sr cache rebuild` rebuilds it byte-for-byte from the immutable raw extracts alone.
 2. `PITStore` is the only read path, and every P0 consumer reads through it.
 3. Gates (a) to (c) pass as the tests in §4.7.
-4. The nightly and weekly jobs (§4.5.6) have run unattended on the VPS, with the Lambda watchdog green.
+4. The nightly and weekly jobs (§4.5.6) have run unattended on this box, with the freshness gate green against the live `load_audit` feed.
 
-**Scope note.** P1 builds data for both markets. Modelling stays US-first (D2): P2–P3 use US data, and HK is still the P4 generalisation test. Its data simply exists earlier.
+**Scope note.** Stage A (this phase, 2026-10-29 re-cut) builds data for the three US indexes; HSI data defers to P4 with modelling (D2). Modelling stays US-first: P2–P3 use US data, and HK is still the P4 generalisation test.
 
 ### 4.2 Architecture (this phase)
 
@@ -678,121 +681,132 @@ which is exactly the touch definition in §2.4 applied to simulated bars. This e
 
 ```mermaid
 flowchart TB
-    subgraph SRC["Sources"]
-        MY["MySQL (DigitalOcean)<br/>in-house daily OHLCV + daily options"]:::new
-        YF["yfinance<br/>split/dividend actions · bars fallback"]
-        TI["Tiingo free tier<br/>US delisted gaps · recon sample"]:::new
-        ED["SEC EDGAR<br/>submissions · daily index · Form 25/15"]:::new
-        FR["FRED / ALFRED"]:::new
-        CUR["curated/*.csv (git)<br/>index membership · HK closures · manual actions"]:::new
+    subgraph UP["UPSTREAM — Fin-Lambda Ops/fin-deep-data (py3.13, LIVE)"]
+        FLA["eodDaily 18:30+19:00 ET<br/>bars → histdailyprice7(_shadow)<br/>actions → corp_action_daily"]
+        FLO["optChainEOD 17:40 + shards/sweeps<br/>chains → OptionChains(_shadow)<br/>raw chains → R2"]
+        FLP["portAssetsHandlerv2<br/>SP500+NDX100+DJIA+HSI<br/>→ Trading.portfolio_assets_info"]
+        FLS["statusReport 20:00 ET<br/>v_load_status → SNS e-mail"]
+        AUD[("load_audit<br/>run_id · job · finished_at<br/>per symbol, per shard")]
+        FLA --> AUD
+        FLO --> AUD
     end
-    subgraph ING["data/ingestion/"]
-        I0["MySqlExtractor<br/>bars + options → raw Parquet extracts"]:::new
-        I1["YFinanceIngestor"]:::new
-        I2["TiingoIngestor + QuotaLedger"]:::new
+    subgraph SRC["Other sources"]
+        MY[("MySQL (DigitalOcean)<br/>GlobalMarketData · Trading<br/>CANONICAL — read-only sr_reader")]:::new
+        YF["yfinance<br/>split/dividend actions · bars fallback"]
+        TI["Tiingo free tier<br/>US delisted gaps · recon sample"]
+        ED["SEC EDGAR<br/>submissions · daily index · Form 25/15"]
+        FR["FRED / ALFRED"]
+        CUR["curated/*.csv (git)<br/>index membership · closures · manual actions"]
+        NWS["Fin-Lambda news → R2<br/>(events; 403 token fix pending)"]
+    end
+    subgraph ING["data/ingestion/ (this box)"]
+        I0["MySqlExtractor<br/>bars + options + audit → raw Parquet"]:::new
+        I1["YFinanceIngestor"]
+        I2["TiingoIngestor + QuotaLedger"]
         I3["EdgarClient"]:::new
         I4["FredClient"]:::new
     end
     MY --> I0
+    AUD -. "available_at = finished_at" .-> I0
+    FLA & FLO & FLP --> MY
+    FLS -. "sr status reads" .-> I0
     YF --> I1
     TI --> I2
     ED --> I3
     FR --> I4
-    I0 & I1 & I2 & I3 & I4 --> RAW[("raw/ — immutable<br/>per (source, object, extract/fetch date)")]:::new
-    CUR --> UB["data/universe.py<br/>UniverseBuilder"]:::new
-    RAW --> LAND["data/lake.py — LakeWriter"]:::new
-    UB --> SM[("security_master · symbol_map · universe_membership")]:::new
-    LAND --> LK[("lake/: bar_daily_raw · corporate_action · bar_daily_ref<br/>option_daily · filing · macro_* · dq_score")]:::new
-    LK --> ADJ["data/adjust.py — PointInTimeAdjuster"]:::new
-    LK --> DQ["data/quality.py — DQScorer"]:::new
-    CAL["data/calendars.py — SessionCalendar<br/>XNYS · XHKG + curated closures"]:::new --> ADJ & DQ
-    SM & LK --> DUCK[("sr.duckdb catalogue")]:::new --> PIT["data/store.py — PITStore<br/>available_at ≤ as_of · adjusts on read"]:::new
+    I0 & I1 & I2 --> RAW[("data/raw/mysql/…<br/>IMMUTABLE extracts<br/>per (source, object, extract_date)")]:::new
+    I3 & I4 --> R2E[("R2 sr-agent/events/<br/>edgar/ · fred/")]:::new
+    NWS -. "P4" .-> R2E
+    CUR --> UB["data/universe.py<br/>UniverseBuilder"]
+    RAW --> CACHE[("data/lake/ — DuckDB + Parquet<br/>COMPUTE CACHE (rebuildable,<br/>NOT canonical)")]:::new
+    UB --> SM[("security_master · symbol_map<br/>universe_membership")]
+    CACHE --> ADJ["data/adjust.py — PointInTimeAdjuster"]
+    CACHE --> DQ["data/quality.py — DQScorer"]
+    CAL["data/calendars.py — SessionCalendar<br/>XNYS + curated closures"]:::new --> ADJ & DQ
+    SM & CACHE & RAW --> PIT["data/store.py — PITStore<br/>available_at ≤ as_of · adjusts on read"]:::new
     ADJ --> PIT
-    PIT --> P0["P0 pipeline (levels → MC → report)"]
+    PIT --> P0["P0 pipeline (levels → MC → report)<br/>sr p0 --store"]
     LEAK["tests/leakage/ — LeakageGuard"]:::new -.-> PIT
     classDef new stroke-width:3px
 ```
 
-**Deployment (existing infrastructure).**
+**Deployment (simplified from the 2026-09-24 four-host design).**
 
 ```mermaid
 flowchart LR
-    subgraph DO["DigitalOcean"]
-        MYSQL[("Managed MySQL<br/>market data — system of record<br/>read-only user sr_reader")]
+    subgraph AWS["AWS — Fin-Lambda Ops/fin-deep-data (owner)"]
+        EB["EventBridge Scheduler (ET)"] --> F1["eodDaily<br/>bars+actions"]
+        EB --> F2["optChainEOD<br/>chains (+raw→R2)"]
+        EB --> F3["statusReport<br/>SNS e-mail"]
+        EB --> F4["portAssetsHandlerv2<br/>membership (pre-cutover: disabled)"]
+        EB -.-> F5["7 more v2 functions<br/>FX · rates · FFF · 15-min · snapshots · news"]
     end
-    subgraph HV["Hostinger VPS — ingest host"]
-        JOBS["systemd timers<br/>sr ingest --nightly / --weekly<br/>DuckDB + Polars · local lake cache"]
+    subgraph DO["DigitalOcean MySQL — CANONICAL"]
+        MYSQL[("GlobalMarketData:<br/>histdailyprice7 · OptionChains ·<br/>corp_action_daily · load_audit ·<br/>FX · USRates · histminprice<br/>Trading: portfolio_assets_info")]
     end
-    subgraph AWS["AWS Serverless"]
-        EB["EventBridge Scheduler"] --> L1["Lambda edgar-daily"]
-        EB --> L2["Lambda fred-vintages"]
-        EB --> L3["Lambda watchdog"]
-        L3 --> SNS["SNS email alert"]
-        SSM[("SSM Parameter Store<br/>secrets")]
+    subgraph CF["Cloudflare R2 — events only"]
+        RNEWS[("NEWS/ (Fin-Lambda hourly)")]
+        REVT[("sr-agent/events/<br/>edgar/ · fred/ (this box)")]
+        RRAW2[("Fin-Lambda raw cache<br/>optchain CSVs · myfindata archive")]
     end
-    subgraph CF["Cloudflare R2 — bucket sr-agent"]
-        RRAW[("raw/ — write-once")]
-        RLAKE[("lake/ — canonical Parquet")]
-        RMAN[("manifests/")]
-    end
-    WS["Workstation<br/>research (P2–P3)<br/>sr lake pull"]
-    MYSQL -- "TLS 3306, trusted source = VPS IP" --> JOBS
-    JOBS --> RRAW & RLAKE & RMAN
-    L1 & L2 --> RRAW
-    L3 -. "reads" .-> RMAN
-    RLAKE --> WS
-    RRAW --> WS
+    BOX["This box — SR repo<br/>sr ingest --full / --nightly / --weekly<br/>MySqlExtractor (read-only, TLS)<br/>PITStore + DuckDB cache<br/>EDGAR/FRED fetchers"]
+    MYSQL -- "TLS 3306, sr_reader SELECT-only" --> BOX
+    F1 & F2 & F4 --> MYSQL
+    F2 --> RRAW2
+    F5 --> MYSQL
+    F5 --> RNEWS
+    BOX -- "events only" --> REVT
+    BOX --> CACHE2[("data/lake/<br/>local DuckDB+Parquet")]
 ```
 
 Responsibilities, and why each host does what it does:
 
 | Host | Runs | Why here |
 |---|---|---|
-| **DO MySQL** | Nothing new. It stays the system of record for in-house market data, and P1 only reads from it. | It is mutable (rows can be restated in place). The point-in-time store needs immutable extracts plus `available_at`, which is why data is copied out, not queried live in backtests. |
-| **Hostinger VPS** | All stateful ingest: MySQL extracts, yfinance, Tiingo, lake build, adjust, DQ, catalogue, R2 upload. | A fixed IP (DO trusted sources allow-list), no 15-min limit, a local disk for DuckDB, and it is always on. |
-| **AWS Lambda** | Stateless fetchers that only write raw text to R2 (EDGAR daily index, FRED vintages) and an **independent watchdog**. | Cheap, scheduled and isolated. The watchdog runs outside the VPS, so it notices when the VPS is down. Lambda does **not** connect to MySQL (dynamic IPs; a VPC + NAT would cost more than it saves) and does **not** call Yahoo (datacenter IPs are throttled, and 1 900 calls exceed 15 min). |
-| **Cloudflare R2** | The **canonical lake** and the write-once raw archive. It is the hand-off point between VPS, Lambda and workstation. | S3 API, free egress (research pulls are free), and DuckDB reads R2 natively (`CREATE SECRET (TYPE r2, …)`). |
-| **Workstation** | Research compute from P2 on. `sr lake pull` syncs R2 → `data/lake/` by manifest hash. | 16 cores / 31 GB for walk-forward work. |
+| **DO MySQL** | Nothing new. It is the **canonical system of record** (owner decision 2026-10-29) for in-house market data, and P1 only reads from it via `sr_reader`. | Fin-Lambda writes it; SR never does. Walk-forward scans run on the local cache, not on MySQL — replay determinism and leakage come from immutable extracts, not from freezing the DB. |
+| **AWS Lambda (Fin-Lambda `fin-deep-data`)** | All market-data collection: bars, options, actions, membership, FX, rates, FFF, 15-min bars, snapshots, news. | It already exists, is tested (426 unit tests), and is the owner's live service. SR adds **nothing** to AWS. |
+| **Cloudflare R2** | **Events only**: Fin-Lambda's `NEWS/` prefix (hourly news, `available_at = providerPublishTime`) and SR's `events/{edgar,fred}/` written by this box's fetchers. Plus Fin-Lambda's raw collector cache (optchain CSVs, the U7 myfindata archive). | Owner decision: news/events are R2's job; market data never round-trips through R2 for SR. |
+| **This box (the workstation)** | All SR compute: MySQL extracts → immutable raw → DuckDB/Parquet cache → `PITStore`; EDGAR/FRED fetchers → R2 events; P0–P6 research. | No VPS is needed: nightly ≈ 5 min, weekly ≈ 20 min, cache ≈ 1–2 GB fits easily. One less host, one less credential set, no trusted-source IP juggling. |
 
 ### 4.3 Data / work flow
 
-**Initial build** (`sr ingest --full` on the VPS; resumable, one `ingest_run` row per step):
+**Initial build** (`sr ingest --full` on this box; resumable, one `ingest_run` row per step):
 
 ```mermaid
 flowchart LR
-    A["1. sr universe build<br/>curated CSVs → security_master,<br/>symbol_map, universe_membership"] --> B["2. security list =<br/>every member ever, 4 indexes"]
-    B --> C["3. MySqlExtractor --full<br/>bars (2008→) + options history<br/>→ raw/mysql/…parquet"]
+    A["1. sr universe build<br/>curated CSVs → security_master,<br/>symbol_map, universe_membership"] --> B["2. security list =<br/>every member ever, 3 US indexes<br/>(HSI at P4)"]
+    B --> C["3. MySqlExtractor --full<br/>bars (2008→) + options history<br/>+ load_audit → raw/mysql/…parquet"]
     C --> COV["4. coverage audit<br/>which securities MySQL lacks"]
     COV --> Y["5. YFinanceIngestor<br/>split/dividend actions (listed);<br/>bars where MySQL lacks"]
     Y -->|"delisted US: actions + gaps"| T["6. TiingoIngestor<br/>≤ QuotaLedger budget"]
     B --> R["7. Tiingo recon sample (50 US)"]
-    C & Y & T & R --> L["8. LakeWriter<br/>bar_daily_raw · corporate_action ·<br/>bar_daily_ref · option_daily"]
-    B --> E["9. EdgarClient (US CIKs)"]
-    F["10. FredClient"]
+    C & Y & T & R --> L["8. cache build (DuckDB)<br/>bar_daily_raw · corporate_action ·<br/>bar_daily_ref · option_daily"]
+    B --> E["9. EdgarClient (US CIKs)<br/>→ R2 events/edgar/"]
+    F["10. FredClient<br/>→ R2 events/fred/"]
     L --> D["11. DQScorer (Friday grid)"]
-    L & E & F & D --> K["12. catalogue refresh"]
+    L & D --> K["12. catalogue refresh (sr.duckdb)"]
     K --> G["13. recon · universe · leakage suites"]
-    G --> U["14. upload lake + manifest → R2"]
 ```
 
-**Nightly** (VPS, Mon–Fri 22:00 America/New_York). The in-house load runs after the US close and finishes before the HK open (21:30 ET in summer, 20:30 ET in winter). A **freshness gate** makes the job wait until `histdailyprice7` holds today's US session and `OptionChains` holds today's `Date`. It polls every 10 min until 23:30, then alerts:
+**Nightly** (this box, Mon–Fri). Fin-Lambda's `eodDaily` (18:30 ET + 19:00 sweep) writes bars and actions; `optChainEOD` (17:40 dispatch + sweeps) writes chains; each writes `load_audit.finished_at` exactly. The SR nightly extract **waits for the freshness gate**: `v_load_status` shows today's `date_hi` for `histdailyprice7` and `OptionChains` (or polls every 10 min until 23:30 ET, then alerts):
 
 ```mermaid
 sequenceDiagram
-    participant J as sr ingest --nightly (VPS)
-    participant M as MySQL (DO)
-    participant W as LakeWriter
-    participant R as R2
-    J->>M: SELECT max(Date) per Exchange (freshness gate)
-    J->>M: histdailyprice7 WHERE Date ≥ last_session − 40 sessions (US, HK)
-    J->>M: OptionChains WHERE Date > last_option_date
-    M-->>J: rows → raw/mysql/{object}/{extract_date}.parquet (immutable)
+    participant J as sr ingest --nightly (this box)
+    participant M as MySQL (DO, canonical)
+    participant C as cache (DuckDB)
+    participant R as R2 events/
+    J->>M: SELECT * FROM v_load_status (freshness gate)
+    J->>M: histdailyprice7(_shadow) WHERE Date ≥ last_session − 40 sessions
+    J->>M: OptionChains(_shadow) WHERE Date > last_option_date
+    J->>M: load_audit WHERE finished_at > last run (exact available_at)
+    M-->>J: rows → data/raw/mysql/{object}/{extract_date}.parquet (immutable)
     J->>J: overlap check on bars (§4.6.7): match → append · mismatch → full re-extract of that security + restatement flag
-    J->>W: rewrite touched partitions (deterministic)
-    J->>R: upload raw + changed partitions + manifests/nightly/{date}.json
+    J->>C: rewrite touched partitions (deterministic)
+    J->>R: (weekly) upload edgar/ + fred/ event objects
 ```
 
-**Weekly** (VPS, Sat 06:00): yfinance split/dividend actions for listed securities (≈ 800 calls) → `corporate_action`. Then universe rebuild, adjust, DQ for the new Friday, catalogue refresh, a leakage smoke test (5 securities), and `manifests/weekly/{date}.json` with gate flags. **Lambda** runs on its own schedule: EDGAR daily index Mon–Fri 22:30, FRED Mon–Fri 17:30, watchdog daily 07:00 and Sat 09:00.
+**Weekly** (this box, Sat 06:00): yfinance split/dividend actions for listed securities (≈ 800 calls) → `corporate_action`; universe diff of `portfolio_assets_info` vs the curated file (S2); adjust, DQ for the new Friday, catalogue refresh, a leakage smoke test (5 securities), and `manifests/weekly/{date}.json` with gate flags. **EDGAR/FRED fetchers** run as local cron: EDGAR daily index Mon–Fri 22:30, FRED Mon–Fri 17:30, each writing `events/{edgar,fred}/{date}/` on R2 (and mirrored locally).
 
 **Point-in-time read** (every consumer from P1 on): the same `AsOfQuery` / `PointInTimeAdjuster` path as before.
 
@@ -800,7 +814,7 @@ sequenceDiagram
 sequenceDiagram
     participant C as Consumer
     participant S as PITStore
-    participant D as DuckDB (local lake or R2)
+    participant D as DuckDB cache (+ raw extracts)
     participant A as PointInTimeAdjuster
     C->>S: bars(security_id, as_of, lookback=500, mode="split")
     S->>D: bar_daily_raw: session ≤ as_of AND available_at ≤ as_of_ts
@@ -826,6 +840,7 @@ classDiagram
         +int page_rows = 200000
         +extract_bars(securities, since) RawFile
         +extract_options(since) RawFile
+        +extract_load_audit(since) RawFile
         +coverage() DataFrame
     }
     class YFinanceIngestor {
@@ -854,20 +869,10 @@ classDiagram
     class FredClient {
         +series(id, vintages) DataFrame
     }
-    class LakeWriter {
-        +ObjectStore store
+    class CacheWriter {
         +write_partition(table, key, df) str
         +rebuild(table) None
     }
-    class ObjectStore {
-        <<abstract>>
-        +put_once(key, path) None
-        +put(key, path) None
-        +get(key, dest) None
-        +list(prefix) list
-    }
-    class LocalStore
-    class R2Store
     class PointInTimeAdjuster {
         +adjust(raw, actions, as_of, mode) DataFrame
     }
@@ -879,6 +884,7 @@ classDiagram
     }
     class UniverseBuilder {
         +build() BuildReport
+        +diff_portfolio_assets() list
     }
     class DQScorer {
         +score(security_id, as_of) DQReport
@@ -902,32 +908,29 @@ classDiagram
     Ingestor <|-- YFinanceIngestor
     Ingestor <|-- TiingoIngestor
     TiingoIngestor --> QuotaLedger
-    ObjectStore <|-- LocalStore
-    ObjectStore <|-- R2Store
-    LakeWriter --> ObjectStore
     PITStore ..> AsOfQuery
     PITStore ..> PointInTimeAdjuster
+    PITStore ..> CacheWriter
     PointInTimeAdjuster ..> SessionCalendar
+    UniverseBuilder ..> MySqlExtractor
 ```
 
 | Module | Class / function | Responsibility | Inputs → Outputs |
 |---|---|---|---|
-| `data/ingestion/mysql.py` | `MySqlExtractor`, `MySqlConfig` | **Primary source for bars (`histdailyprice7`) and options (`OptionChains`)** wherever the in-house tables cover a security. MySQL `FLOAT` is 4-byte single precision, so values are cast to `DOUBLE` on extract. The cast is exact, but the stored precision is ~7 significant digits: prices are exact to well under a tick, and volumes above 2²⁴ are rounded by ≤ 6·10⁻⁸ relative. Strikes are rounded to 0.001 on extract so contract keys are stable. The DuckDB `mysql` extension (`ATTACH … (TYPE mysql, READ_ONLY)`) with `COPY (SELECT …) TO … (FORMAT parquet)` writes typed raw extracts, one query per `(object, market, year)` for the full build and per date range for the nightly run. No row-by-row Python. Uses a read-only user over TLS (`ssl_ca`) and never writes to MySQL. `coverage()` reports, per `security_id`, the first and last session and row count in MySQL, which drives the fallback chain (§4.6.2). Column mapping lives in `config/sources.yaml: mysql` (table and column names), so the class does not hard-code the in-house schema. | → `raw/mysql/{bars\|options}/{market}/{extract_date}/…parquet` |
-| `data/ingestion/yfinance.py` | `YFinanceIngestor` | (1) **Corporate actions for listed securities**: `Dividends` and `Stock Splits`. These are needed to recover traded prices from the MySQL mirror (§4.6.1). (2) **Bars** only when MySQL lacks the security. Reference closes are *not* fetched: the MySQL data is itself yfinance, so they would not be independent. The P0 `YFinanceSource` is wrapped, not replaced. | → `corporate_action`, `bar_daily_ref`, fallback `bar_daily_raw` |
+| `data/ingestion/mysql.py` | `MySqlExtractor`, `MySqlConfig` | **Primary source for bars (`histdailyprice7`/`histdailyprice7_shadow`), options (`OptionChains`/`OptionChains_shadow`), `corp_action_daily` and `load_audit`** wherever the in-house tables cover a security. Table names come from `config/sources.yaml: mysql` (with a `use_shadow: bool` flag flipped at the U6 cutover — the code never hard-codes which). MySQL `FLOAT` is 4-byte single precision, so values are cast to `DOUBLE` on extract. The cast is exact, but the stored precision is ~7 significant digits: prices are exact to well under a tick, and volumes above 2²⁴ are rounded by ≤ 6·10⁻⁸ relative. Strikes are rounded to 0.001 on extract so contract keys are stable. The DuckDB `mysql` extension (`ATTACH … (TYPE mysql, READ_ONLY)`) with `COPY (SELECT …) TO … (FORMAT parquet)` writes typed raw extracts, one query per `(object, market, year)` for the full build and per date range for the nightly run. No row-by-row Python. Uses a read-only user `sr_reader` over TLS (`ssl_ca`) and never writes to MySQL. `extract_load_audit(since)` pulls new `load_audit` rows; their `finished_at` becomes the exact `available_at` for the bars extracted in the same run (S1). `coverage()` reports, per `security_id`, the first and last session and row count in MySQL, which drives the fallback chain (§4.6.2). | → `raw/mysql/{bars\|options\|audit}/{extract_date}/…parquet` |
+| `data/ingestion/yfinance.py` | `YFinanceIngestor` | (1) **Corporate actions for listed securities**: `Dividends` and `Stock Splits` with `auto_adjust=False, actions=True` pinned (L1). Before the U6 cutover this is the only actions source for pre-shadow history; after it, `corp_action_daily` (with `first_seen_at`) covers rows the Fin-Lambda job wrote, and yfinance covers the rest. (2) **Bars** only when MySQL lacks the security. Reference closes are *not* fetched: the MySQL data is itself yfinance, so they would not be independent. The P0 `YFinanceSource` is wrapped, not replaced. | → `corporate_action`, `bar_daily_ref`, fallback `bar_daily_raw` |
 | `data/ingestion/tiingo.py` | `TiingoIngestor`, `QuotaLedger` | (1) **Split/dividend actions for delisted US names**, which yfinance no longer serves (one call each, ≈ 350 names, one 30-day quota window). (2) Bars for US securities absent from MySQL. (3) The 50-name reconciliation sample, the only source independent of Yahoo. Quota: 500 symbols per 30 d, 50 req/h, 1 000 req/d, refused rather than exceeded. | → fallback `bar_daily_raw`, `bar_daily_ref`, `corporate_action` |
-| `data/ingestion/edgar.py` | `EdgarClient` | Initial: submissions JSON for US CIKs (10-K/10-Q/8-K and 20-F/6-K filers). Nightly (Lambda): daily-index filtered to tracked CIKs, with acceptance ts from each filing's `-index.htm`. Form 25/15 for delistings. ≤ 5 req/s with `SEC_USER_AGENT`. HK has no EDGAR; HK delisting evidence is an HKEXnews URL in the curated file. | → `filing`, delisting evidence |
-| `data/ingestion/fred.py` | `FredClient` | ALFRED vintages; `available_at = vintage release ts`; 13 series (§4.5.1). Runs in Lambda. | → `macro_series`, `macro_release` |
-| `data/objectstore.py` | `ObjectStore`, `LocalStore`, `R2Store` | Where raw extracts and lake partitions live. `put_once` refuses to overwrite a key with different content (HEAD, then PUT with `If-None-Match: *`). `R2Store` uses boto3 against `https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com`. `LocalStore` is used by tests and offline runs. This sits in L1 because the lake needs it; it has no knowledge of ingest schedules. | — |
-| `data/lake.py` | `LakeWriter` | Deterministic Parquet (§4.6.8). It rewrites one partition at a time, writes locally first, then uploads to the `ObjectStore`, and records `manifests/…json` (key, sha256, rows). `rebuild(table)` folds every raw extract in `(extract_date, source, object)` order. **Options are not copied**: `option_daily` is a DuckDB view over the raw option extracts plus a computed `available_at` (§4.6.9), so the largest dataset is stored once. | raw → `lake/<table>/…` |
+| `data/ingestion/edgar.py` | `EdgarClient` | Initial: submissions JSON for US CIKs (10-K/10-Q/8-K and 20-F/6-K filers). Nightly (this box, cron 22:30): daily-index filtered to tracked CIKs, with acceptance ts from each filing's `-index.htm`. Form 25/15 for delistings. ≤ 5 req/s with `SEC_USER_AGENT`. Writes raw JSON to R2 `events/edgar/{date}/` **and** a local mirror; the `filing` table is built from the local mirror. HK has no EDGAR; HK delisting evidence is an HKEXnews URL in the curated file. | → `filing`, delisting evidence, R2 `events/edgar/` |
+| `data/ingestion/fred.py` | `FredClient` | ALFRED vintages; `available_at = vintage release ts`; 13 series (§4.5.1). Runs on this box (cron 17:30), raw vintage JSON to R2 `events/fred/{date}/` + local mirror. | → `macro_series`, `macro_release` |
+| `data/cachewriter.py` | `CacheWriter` | Replaces the VPS-era `LakeWriter`+`ObjectStore`. Deterministic Parquet (§4.6.8) under `data/lake/<table>/`; rewrites one partition at a time; records `manifests/…json` (key, sha256, rows) **locally** (manifests are for cache rebuild and DQ, not for any R2 sync). `rebuild(table)` folds every raw extract in `(extract_date, source, object)` order — the cache is a pure function of `data/raw/` + `curated/`. **Options are not copied**: `option_daily` is a DuckDB view over the raw option extracts plus a computed `available_at` (§4.6.9), so the largest dataset is stored once. | raw → `data/lake/<table>/…` |
 | `data/adjust.py` | `PointInTimeAdjuster` | §4.6.1; `mode ∈ {"split","total","none"}`; pure, with no I/O. Also writes `bar_daily_adj_latest` (for recon only; not readable via `PITStore`). | raw + actions + as_of → adjusted |
-| `data/calendars.py` | `SessionCalendar` | `exchange_calendars` XNYS/XHKG plus `curated/exchange_closures.csv` (§4.6.5), materialised into `session_calendar`. | — |
-| `data/universe.py` | `MembershipDrafter`, `UniverseBuilder` | Drafts from pinned Wikipedia revisions (S&P 500, Nasdaq-100, DJIA, HSI change tables). A human verifies the draft and promotes it to `curated/index_membership.csv`. The builder does a full deterministic rebuild of `security_master`, `symbol_map` (sources `mysql`, `yfinance`, `tiingo`) and `universe_membership`. | → three tables |
+| `data/calendars.py` | `SessionCalendar` | `exchange_calendars` XNYS (XHKG at P4) plus `curated/exchange_closures.csv` (§4.6.5), materialised into `session_calendar`. | — |
+| `data/universe.py` | `MembershipDrafter`, `UniverseBuilder` | Drafts from pinned Wikipedia revisions (S&P 500, Nasdaq-100, DJIA change tables; HSI at P4). A human verifies the draft and promotes it to `curated/index_membership.csv`. The builder does a full deterministic rebuild of `security_master`, `symbol_map` (sources `mysql`, `yfinance`, `tiingo`) and `universe_membership`. `diff_portfolio_assets()` reads `Trading.portfolio_assets_info` and opens a review item for every difference vs the curated file (S2). | → three tables |
 | `data/quality.py` | `DQScorer` | §4.6.3. | → `dq_score` |
-| `data/store.py` | `PITStore`, `AsOfQuery` | The only read path. `lake_uri` is either `data/lake` or `r2://sr-agent/lake`. `AsOfQuery.sql()` always binds `available_at <= ?`. The allow-list excludes `bar_daily_adj_latest`. | — |
-| `ops/lambdas.py` | `edgar_daily_handler`, `fred_handler`, `watchdog_handler` | Lambda entry points (L5). The fetchers call `EdgarClient` / `FredClient` and `R2Store.put_once` raw text only; the VPS lands it. The watchdog checks that `manifests/weekly/` has this week's file with all gate flags green and `manifests/nightly/` has ≤ 1 missing weekday, and publishes to SNS otherwise. | — |
-| `ops/systemd/`, `infra/aws/template.yaml` | units and timers; AWS SAM template | VPS schedule; Lambda functions (container image, arm64, Python 3.11) + EventBridge Scheduler + SNS topic + SSM parameters. | — |
-| `cli.py` | `sr universe draft\|build\|check`, `sr ingest --full\|--nightly\|--weekly [--only …]`, `sr ingest tiingo-backfill --budget N`, `sr mysql coverage`, `sr lake rebuild\|pull`, `sr catalogue refresh`, `sr dq TICKER --as-of`, `sr recon`, `sr restore`, `sr p0 --store` | Thin commands over the above. | — |
-| `tests/leakage/guard.py` | `LeakageGuard` | A physically truncated lake copy, so the probe is not tautological with `PITStore`'s filter. | — |
+| `data/store.py` | `PITStore`, `AsOfQuery` | The only read path. `AsOfQuery.sql()` always binds `available_at <= ?`. Reads resolve to `data/lake/` views over the raw extracts; the allow-list excludes `bar_daily_adj_latest`. | — |
+| `ops/schedules.py` | local cron definitions | EDGAR 22:30 Mon–Fri, FRED 17:30 Mon–Fri, `sr ingest --nightly` after the freshness gate, `sr ingest --weekly` Sat 06:00, `sr recon` 1st Sat monthly. A **local watchdog** (`sr status --alert`) replaces the Lambda watchdog: same stale/partial rules on `v_load_status` + `ingest_run`, exit code + stderr for cron e-mail. It is not independent of the box it runs on — accepted, because Fin-Lambda's `statusReport` SNS e-mail already provides the independent upstream alert. | — |
+| `cli.py` | `sr universe draft\|build\|check`, `sr ingest --full\|--nightly\|--weekly [--only …]`, `sr ingest tiingo-backfill --budget N`, `sr mysql coverage`, `sr cache rebuild`, `sr catalogue refresh`, `sr dq TICKER --as-of`, `sr recon`, `sr status [--alert]`, `sr p0 --store` | Thin commands over the above. (`sr lake pull/restore` are **removed** — there is no R2 lake to pull.) | — |
+| `tests/leakage/guard.py` | `LeakageGuard` | A physically truncated cache copy, so the probe is not tautological with `PITStore`'s filter. | — |
 
 The CBOE archiver of the 2026-09-23 draft is **dropped**: the in-house daily options data supersedes it.
 
@@ -937,14 +940,16 @@ The CBOE archiver of the 2026-09-23 draft is **dropped**: the in-house daily opt
 
 | Source | P1 role | Markets | Rate / access discipline |
 |---|---|---|---|
-| **MySQL (DO)** — `histdailyprice7` | **Spine** for every security it covers (a yfinance mirror incl. delisted names up to their delisting date) | US, HK | read-only user, TLS, VPS IP only; paged bulk queries, off-peak |
-| **MySQL (DO)** — `OptionChains` | Lands as `option_daily` (point-in-time; archive for the P4 options module, BP §8 rung 7) | ≈ 50 US stocks/ETFs | same |
-| yfinance | Split/dividend actions for listed names; bars fallback | US, HK | ≥ 1 s/call + jitter, backoff; VPS only |
+| **MySQL (DO)** — `histdailyprice7` (+ `_shadow` until the U6 cutover) | **Spine** for every security it covers (a yfinance mirror incl. delisted names up to their delisting date) | US, HK (HSI consumed at P4) | read-only user `sr_reader`, TLS, **this box's IP** in DO Trusted Sources; paged bulk queries, off-peak |
+| **MySQL (DO)** — `load_audit`, `corp_action_daily` | **Exact `available_at`** (§4.6.1, S1) and the freshness/trigger signal; actions for names delisted after the cutover (S3) | US | same |
+| **MySQL (DO)** — `OptionChains` (+ `_shadow` until cutover) | Lands as `option_daily` (point-in-time; archive for the P4 options module, BP §8 rung 7) | ≈ 50 US stocks/ETFs | same |
+| yfinance | Split/dividend actions for listed names; bars fallback | US | ≥ 1 s/call + jitter, backoff; this box |
 | Tiingo free | Split/dividend actions for delisted US names; bars fallback; the independent 50-name recon sample | US | `QuotaLedger` (500 sym/30 d, 50 req/h, 1 000 req/d, 1 GB/mo) |
-| SEC EDGAR | CIKs, filing index + acceptance ts, Form 25/15 | US (incl. 20-F filers in NDX) | ≤ 5 req/s, `SEC_USER_AGENT` |
-| FRED / ALFRED | `DGS10, DGS2, DTB3, DFF, T10Y2Y, VIXCLS, BAMLH0A0HYM2, UNRATE, CPIAUCSL, INDPRO, UMCSENT, USREC, DTWEXBGS` | US macro | ≤ 60 req/min |
+| SEC EDGAR | CIKs, filing index + acceptance ts, Form 25/15 | US (incl. 20-F filers in NDX) | ≤ 5 req/s, `SEC_USER_AGENT`; raw to R2 `events/edgar/` |
+| FRED / ALFRED | `DGS10, DGS2, DTB3, DFF, T10Y2Y, VIXCLS, BAMLH0A0HYM2, UNRATE, CPIAUCSL, INDPRO, UMCSENT, USREC, DTWEXBGS` | US macro | ≤ 60 req/min; raw to R2 `events/fred/` |
 | Index sources (curated) | S&P DJI press releases; Nasdaq-100 annual/quarterly change notices; DJIA changes; Hang Seng Indexes quarterly review announcements; pinned Wikipedia revisions as the draft | all | manual, one `source_url` per row |
-| HKEXnews (curated) | HK delisting / privatisation evidence; HK rights-issue terms not in yfinance | HK | manual |
+| HKEXnews (curated) | HK delisting / privatisation evidence; HK rights-issue terms not in yfinance | HK | manual (used at P4) |
+| Fin-Lambda news → R2 `NEWS/` | P4 text features, `available_at = providerPublishTime` | US | not consumed in P1 (and blocked on the owner's R2 token fix, 2026-10-14) |
 
 **M0 audit of the MySQL data — owner's answers (2026-09-24) and consequences:**
 
@@ -955,9 +960,9 @@ The CBOE archiver of the 2026-09-23 draft is **dropped**: the in-house daily opt
 | Delisted securities? | **Yes**, up to the delisting date | This is the survivorship defence. Coverage of a delisted name depends on whether it was collected before yfinance dropped it, which `sr mysql coverage` measures. Split events for delisted names come from Tiingo (yfinance has none). |
 | Vendor | yfinance | Live yfinance is **not** an independent reconciliation source, so gate a rests on the Tiingo sample (§4.6.2). |
 | `updated_at` column? | No | Restatements are detected by the 40-session overlap check (§4.6.7). |
-| Load time | Every weeknight, after the US close and before the HK/China open | Nightly extract at 22:00 ET behind a freshness gate (§4.5.6). |
+| Load time | Every weeknight, after the US close and before the HK/China open | Nightly extract behind a freshness gate on `load_audit`/`v_load_status` (§4.5.6 rev). |
 | Options table | `OptionChains`: PK `(Date, Section, UnderlyingSymbol, strike, Expiration, OptionType)`; `contractSymbol, lastTradeDate (varchar), lastPrice, bid, ask, change, percentChange, volume, openInterest, impliedVolatility, inTheMoney, contractSize, currency, UnderlyingPrice`; captured daily after the US close; ≈ 50 US stocks/ETFs | This is yfinance's `option_chain()` layout: no greeks, Yahoo-computed IV, and open interest that is the prior session's. `available_at` and field semantics are in §4.6.9. |
-| VPS | 4 vCPU / 16 GB / 200 GB NVMe / 16 TB transfer | Holds the whole lake locally; §4.5.5. |
+| `load_audit` | Live since 2026-10-06 (shadow): exact `finished_at` per symbol/shard, `yf_version`, host | SR's `available_at` for new rows (S1); `v_load_status` drives the freshness gate and `sr status`. |
 
 **Still to measure in M0** (queries, no decisions needed):
 
@@ -991,143 +996,135 @@ DDL is in Appendix A. The small tables (`security_master`, `symbol_map`, `univer
 
 #### 4.5.3 Resource — database
 
-**Choice: MySQL stays the upstream system of record. The point-in-time store is DuckDB over Parquet (D6), and the Parquet lives in R2.**
+**Choice (amended 2026-10-29, owner decision): MySQL is the canonical store for market data. SR extracts it into immutable raw extracts and a rebuildable DuckDB/Parquet compute cache on this box. There is no SR canonical lake on R2 (D6, D9).**
 
 | Option | Verdict | Reason |
 |---|---|---|
-| Query MySQL directly for backtests | no | Mutable rows break replay determinism (BP §10.4.4) and leakage-as-a-type-error (rows have no `available_at`). Walk-forward runs scan ~10⁷ bar rows and, from P2, ~10⁸ candidate/feature rows repeatedly, which is a row store over a WAN. It would also put research load on the production market-data DB. |
+| Query MySQL directly for backtests | no | Mutable rows break replay determinism (BP §10.4.4) and leakage-as-a-type-error (rows lack `available_at` before the audit era). Walk-forward runs scan ~10⁷ bar rows and, from P2, ~10⁸ candidate/feature rows repeatedly, which is a row store over a WAN. It would also put research load on the production market-data DB. |
 | Add `available_at` tables inside MySQL | no | Solves leakage but not scan cost or determinism, and it adds schema to a DB that other systems own. |
-| **Extract → immutable Parquet → DuckDB** | **yes** | Columnar and local-speed. Extracts are immutable, so `lake rebuild` is byte-reproducible. DuckDB reads MySQL (extension), local Parquet and R2 with one engine. |
+| **Extract → immutable raw → DuckDB compute cache (this box)** | **yes** | Columnar and local-speed. Extracts are immutable, so `sr cache rebuild` is byte-reproducible. DuckDB reads MySQL (extension) and local Parquet with one engine. |
+| ~~R2 canonical lake~~ | **dropped 2026-10-29** | Market data flows MySQL → this box directly; a second canonical copy added sync complexity and a third place for drift. R2 keeps **events only** (§4.5.4). |
 
 Settings:
 
-- `duckdb` pinned `>=1.1,<2` with the `mysql` and `httpfs` extensions (version-pinned and installed at build time on the VPS);
-- `SET threads = 4 (VPS) / 8 (workstation); SET memory_limit = '10GB' (VPS, 16 GB RAM) / '8GB'; SET TimeZone = 'UTC'`;
-- one writer per host, holding `data/.ingest.lock`; readers open `read_only`.
+- `duckdb` pinned `>=1.1,<2` with the `mysql` extension (version-pinned and installed at build time; `httpfs` only if R2 events are queried directly);
+- `SET threads = 8; SET memory_limit = '8GB'; SET TimeZone = 'UTC'` (this box has 16 cores / 31 GB);
+- one writer, holding `data/.ingest.lock`; readers open `read_only`.
 
 **MySQL requirements** (on the DO side; nothing is bought):
 
 - a read-only user `sr_reader` with `SELECT` on the market-data schema only;
-- the VPS public IP added to DO *Trusted Sources*, plus the workstation IP if ad-hoc extracts are wanted;
+- **this box's public IP** added to DO *Trusted Sources* (it replaces the VPS IP of the 2026-09-24 draft);
 - a read-only replica or a connection pool, if the cluster has one, to keep bulk extracts off the primary;
 - env `MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE, MYSQL_SSL_CA`.
 
 **MySQL load:**
 
-- initial extract: one paged scan per `(object, market, year)`, run off-peak (Sat 02:00–06:00 ET);
-- nightly: two range queries on the leading PK column, `histdailyprice7 WHERE Date >= ?` and `OptionChains WHERE Date > ?`;
+- initial extract: one paged scan per `(object, year)`, run off-peak (Sat 02:00–06:00 ET);
+- nightly: two range queries on the leading PK column, `histdailyprice7 WHERE Date >= ?` and `OptionChains WHERE Date > ?`, plus `load_audit WHERE finished_at > ?`;
 - restatement re-extracts `WHERE Symbol IN (…)` are batched into one scan per night, because `Symbol` is not a PK prefix.
 
-**Sizing** (bars: estimates; options: ≈ 50 underlyings per the owner, row rate estimated until M0 measures it; ≈ 1 150 securities = US ≈ 1 020 ever in S&P 500 ∪ NDX ∪ DJIA since 2010, HK ≈ 130 ever in HSI; bars from 2008):
+**Sizing** (bars: estimates; options: ≈ 50 underlyings per the owner, row rate estimated until M0 measures it; universe re-cut 2026-10-29 to **US ≈ 1 020 ever in S&P 500 ∪ NDX 100 ∪ DJIA since 2010** — HK ≈ 130 HSI names defer to P4, so counts below are US-only; bars from 2008):
 
 | Dataset | Rows | Parquet (zstd) |
 |---|---|---|
-| `bar_daily_raw` | ≈ 4.5 M | ≈ 150 MB |
-| `bar_daily_adj_latest` + `bar_daily_ref` | ≈ 9 M | ≈ 300 MB |
-| `corporate_action` | ≈ 50 k | < 5 MB |
+| `bar_daily_raw` | ≈ 4.0 M | ≈ 130 MB |
+| `bar_daily_adj_latest` + `bar_daily_ref` | ≈ 8 M | ≈ 260 MB |
+| `corporate_action` | ≈ 45 k | < 5 MB |
 | `filing` (US) | ≈ 1.5 M | ≈ 60 MB |
 | `macro_*`, `dq_score` | ≈ 2 M | ≈ 50 MB |
-| **Lake excluding options** | | **≈ 0.6 GB** (growth ≈ 0.1 GB/yr) |
-| `option_daily`, ≈ 50 US underlyings | `R` ≈ 100–150 k contracts/day (SPY-class ETFs ≈ 5–10 k each, single stocks ≈ 1–3 k) → 25–38 M/yr | ≈ 0.8–1.2 GB/yr (≈ 32 B/row) |
+| **Cache excluding options** | | **≈ 0.5 GB** (growth ≈ 0.1 GB/yr) |
+| `option_daily` (view) + raw option extracts, ≈ 50 US underlyings | `R` ≈ 100–150 k contracts/day (SPY-class ETFs ≈ 5–10 k each, single stocks ≈ 1–3 k) → 25–38 M/yr | ≈ 0.8–1.2 GB/yr (≈ 32 B/row) |
 
-Options still dominate storage, but at ≈ 1 GB/yr the whole lake fits the VPS disk (200 GB) and R2's free tier for years. M0 replaces `R` and the history depth with `COUNT(*)` / `MIN(Date)`.
+Options still dominate storage, but at ≈ 1 GB/yr the whole cache fits this box's disk for years. M0 replaces `R` and the history depth with `COUNT(*)` / `MIN(Date)`.
 
 #### 4.5.4 Resource — Cloudflare R2
 
-**Role (changed from the 2026-09-23 draft).** R2 is now the **canonical home of the lake and the write-once raw archive**, and the hand-off point between VPS, Lambda and workstation. It is not just a backup. Local disks hold caches of it.
+**Role (repurposed 2026-10-29, owner decision).** R2 is **not** a data lake. It holds **news and events only**: Fin-Lambda's `NEWS/` prefix (hourly news, P4) and SR's `events/{edgar,fred}/` raw text written by the fetchers on this box. Fin-Lambda's own raw collector cache (`optchain` CSVs, the U7 myfindata archive) also lives there, owned and read by Fin-Lambda (U7's `sr mysql import-cache` reads it once).
 
 | Item | Setting |
 |---|---|
 | Bucket | `sr-agent`, Standard class |
-| Endpoint / auth | `https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com`, S3 API, region `auto`. Two tokens scoped to the bucket: **VPS** read & write; **Lambda + workstation** write-only on `raw/{edgar,fred}/`, read elsewhere. Env `R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET`; Lambda reads them from SSM. |
-| Key layout | `raw/{source}/{object}/{market}/{extract_date}/part-*.parquet\|.csv.gz` **write-once** · `lake/{table}/market=/year=/part-0.parquet` (rewritten per partition) · `manifests/{nightly,weekly}/{date}.json` · `curated/` (mirror of git) |
-| Immutability | `put_once` in code on `raw/`; also an R2 bucket-lock rule on `raw/` if the account offers it (M0) |
-| DuckDB access | `CREATE SECRET r2 (TYPE r2, KEY_ID …, SECRET …, ACCOUNT_ID …)`; `PITStore(lake_uri="r2://sr-agent/lake")` works without a local copy (slower; used by the watchdog-free smoke test) |
-| Restore | `sr restore` = pull `raw/`, then `sr lake rebuild`; the quarterly drill hash-compares against `manifests/weekly/` |
+| Prefixes | `events/edgar/{date}/…json` · `events/fred/{date}/…json` (SR, write-once via `put_once`) · `NEWS/` (Fin-Lambda, P4) · Fin-Lambda's raw cache (owner) |
+| Auth | S3 API, region `auto`; one token scoped to `events/*` write + read. Env `R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET`. |
+| Local mirror | Every R2 event object is also written to `data/raw/events/` before upload, so SR works with R2 offline and the cache rebuild never needs the network. |
+| DuckDB access | Not required for the cache (local Parquet only). `httpfs` is optional for ad-hoc event queries. |
+| Restore drill | Not needed for market data (MySQL is canonical); a yearly drill re-reads `events/` only. |
 
-**Storage and cost** (free tier: 10 GB-month Standard, 1 M Class A, 10 M Class B; beyond that $0.015/GB-month, $4.50/M Class A, $0.36/M Class B, egress free):
-
-| Component | Size |
-|---|---|
-| Lake excluding options | ≈ 0.6 GB |
-| Raw extracts, bars + actions + EDGAR + FRED | ≈ 0.4 GB, + ≈ 0.3 GB/yr |
-| Options (stored once, as raw extracts), ≈ 50 underlyings | ≈ 1 GB per history-year, + ≈ 1 GB/yr |
-| **Total with 5 yr of options history** | ≈ 1 + 5 ≈ **6 GB → $0** (the free tier holds until ≈ 3–4 more years of growth) |
-| Class A ops | ≈ 3 k/mo (nightly ≈ 6 files × 22 + weekly ≈ 80 partitions × 4.3 + Lambda ≈ 450 raw objects) |
-| Class B ops | ≈ 20 k/mo (HEADs + workstation pulls) |
-
-Ops stay well under 1 % of the free quota. When the bucket passes 8 GB (≈ 2029 at this rate), the manifest job warns. Overage is $0.015/GB-month (≈ $0.03/mo per extra 2 GB).
+**Storage and cost** (free tier: 10 GB-month Standard; egress free): EDGAR + FRED raw ≈ 0.3 GB/yr, news (P4) ≈ 1–2 GB/yr → **$0** for years. Ops ≈ 1 k Class A/mo (one PUT per fetched file), well under 1 % of quota.
 
 #### 4.5.5 Resource — compute
 
 | Host | Minimum spec for P1 | P1 load |
 |---|---|---|
-| **Hostinger VPS** (ingest host) | **4 vCPU / 16 GB RAM / 200 GB NVMe / 16 TB transfer** (owner's VPS; ≥ 2 vCPU / 8 GB would suffice). Ubuntu 24.04, `uv`, Python 3.11, systemd timers, static IP. | Nightly ≈ 5 min at < 1 GB RAM. Weekly ≈ 20 min at ≈ 3 GB. Initial build ≈ 1.5 h. The whole lake (≈ 7 GB with 5 yr of options) stays on local disk, so no eviction is needed. Spare capacity for P6's scheduled forecast run. |
-| **AWS Lambda** | 3 functions, container image, arm64, 512 MB, timeout 5 min; EventBridge Scheduler; SNS; SSM Standard parameters | ≈ 70 invocations/month, each < 2 min → ≈ 2 k GB-s/month. Inside the Lambda free tier (1 M requests, 400 k GB-s), so **$0**. |
-| **DO MySQL** | existing cluster | Initial extract: one long read scan per table and year, off-peak (Sat 02:00–06:00 ET). Nightly: two PK-range queries, < 1 min, after the owner's load has finished. |
-| **Workstation** | 16 cores / 31 GB (unchanged) | P1: development and tests only. From P2, research reads the pulled lake. Disk has 60 GB free (87 % used); pull options selectively (`sr lake pull --tables … --years …`). |
+| **This box (the workstation, ingest + research host)** | 16 cores / 31 GB / ≥ 20 GB free disk | Nightly ≈ 5 min at < 1 GB RAM. Weekly ≈ 20 min at ≈ 3 GB. Initial build ≈ 1.5 h. The whole cache (≈ 1.5 GB with 5 yr of options) stays on local disk. No scheduling infrastructure beyond cron. |
+| **DO MySQL** | existing cluster | Initial extract: one long read scan per table and year, off-peak (Sat 02:00–06:00 ET). Nightly: two PK-range queries + the audit tail, < 1 min, after Fin-Lambda's load has finished. |
+| **AWS Lambda (Fin-Lambda `fin-deep-data`)** | existing service — SR provisions nothing | Owner's collection schedule (§4.5.6 rev). SR consumes its tables and `load_audit`; `statusReport` SNS e-mail is the independent upstream alert. |
+| **Cloudflare R2** | free tier | Events only; ≈ 1 k writes/mo. |
 
 | Job | Host | Wall time | Bound by |
 |---|---|---|---|
-| MySQL full extract, bars (≈ 4.5 M rows) | VPS | ≈ 2–5 min | WAN + MySQL scan |
-| MySQL full extract, options (≈ 25–38 M rows per history-year) | VPS | ≈ 6–9 min per history-year at ≈ 75 k rows/s | WAN; measured in M0 |
-| yfinance actions, ≈ 800 listed securities | VPS | ≈ 15–20 min | 1 s/call politeness |
-| Tiingo: actions for ≈ 350 delisted US names + bar gaps + 50 recon | VPS | ≈ 8 h unattended, one 30-day window | 50 req/h, 500 sym/30 d |
-| EDGAR initial, ≈ 1 600 calls | VPS | ≈ 6 min | 5 req/s |
-| Lake rebuild excluding options | VPS | ≈ 1–2 min | Polars |
-| DQ Friday grid (≈ 1 M scores) | VPS | ≈ 1 min | Polars |
-| Leakage suite | workstation / CI | ≈ 1–2 min | Parquet rewrite |
+| MySQL full extract, bars (≈ 4.0 M rows) | this box | ≈ 2–5 min | WAN + MySQL scan |
+| MySQL full extract, options (≈ 25–38 M rows per history-year) | this box | ≈ 6–9 min per history-year at ≈ 75 k rows/s | WAN; measured in M0 |
+| yfinance actions, ≈ 800 listed securities | this box | ≈ 15–20 min | 1 s/call politeness |
+| Tiingo: actions for ≈ 350 delisted US names + bar gaps + 50 recon | this box | ≈ 8 h unattended, one 30-day window | 50 req/h, 500 sym/30 d |
+| EDGAR initial, ≈ 1 600 calls | this box | ≈ 6 min | 5 req/s |
+| Cache rebuild excluding options | this box | ≈ 1–2 min | Polars |
+| DQ Friday grid (≈ 1 M scores) | this box | ≈ 1 min | Polars |
+| Leakage suite | this box / CI | ≈ 1–2 min | Parquet rewrite |
 
 #### 4.5.6 Resource — time of operation
 
-All times are America/New_York. HK closes at 16:00 HKT = 04:00 ET (EDT) / 03:00 ET (EST).
+All times are America/New_York.
 
-**One-off initial build** (after M0–M7 code exists): ≈ 1.5 h active on the VPS (options history ≈ 6–9 min per year of history; bars minutes), plus one unattended Tiingo window (≈ 8 h) for delisted-US split/dividend actions and the recon sample.
+**One-off initial build** (after M0–M7 code exists): ≈ 1.5 h active on this box (options history ≈ 6–9 min per year of history; bars minutes), plus one unattended Tiingo window (≈ 8 h) for delisted-US split/dividend actions and the recon sample.
 
-**Recurring schedule:**
+**Recurring schedule** (rev 2026-10-29 — all jobs on this box; upstream is Fin-Lambda's live service):
 
 | Job | Host | When | Duration | Why then |
 |---|---|---|---|---|
-| `sr ingest --nightly` (MySQL bars + options, US + HK) | VPS | Mon–Fri 22:00, freshness-gated (polls to 23:30). After the upstream cutover (§4.5.7 U6) it starts on the `load_audit` signal from 19:00 (≈ 18:45 load finish), and the 22:00 gate becomes the fallback | ≈ 5 min | the owner's load runs after the US close and finishes before the HK open (21:30 ET summer / 20:30 ET winter); HK's session closed at 04:00 / 03:00 ET the same day |
-| `sr ingest --weekly` (actions, universe, adjust, DQ, catalogue, leakage smoke, manifest) | VPS | Sat 06:00 | ≈ 20 min | Friday's nightly extract has landed; nothing trades |
-| `edgar-daily` | Lambda | Mon–Fri 22:30 | < 1 min | EDGAR's daily index is published after the 22:00 acceptance cut-off |
-| `fred-vintages` | Lambda | Mon–Fri 17:30 | < 1 min | after most FRED releases |
-| `watchdog` | Lambda | daily 07:00 (checks last night's manifest), Sat 09:00 (weekly) | < 10 s | outside the VPS, so it can detect a dead VPS |
-| `sr recon` (Tiingo 50-name sample) | VPS | 1st Sat monthly, 09:00 | ≈ 1 h | 50 req/h |
-| Universe file update | workstation | S&P 500 / DJIA: as announced (≈ 5 sessions before effective). NDX: December annual reconstitution + ad hoc. HSI: quarterly review (results announced mid-Feb/May/Aug/Nov, effective about three weeks later) | ≈ 1 h each, manual | each row needs a `source_url` |
-| HK closure file update | workstation | after any typhoon/black-rainstorm closure before 2024-09-23; none expected since Severe Weather Trading | minutes | — |
-| Restore drill | VPS | quarterly | ≈ 15 min | proves R2 restores |
+| Fin-Lambda `eodDaily` → bars/actions | AWS (owner) | Mon–Fri 18:30 ET + shards + 19:00 sweep | upstream | writes `load_audit`; SR consumes |
+| Fin-Lambda `optChainEOD` → chains | AWS (owner) | 17:40 ET start + shards/sweep | upstream | writes `load_audit`; raw chains → R2 |
+| Fin-Lambda `statusReport` | AWS (owner) | Mon–Fri 20:00 ET | upstream | SNS e-mail = independent upstream alert |
+| `sr ingest --nightly` (MySQL bars + options, audit tail) | this box | Mon–Fri, freshness-gated: starts from the `load_audit` signal (poll from 19:00, S1); falls back to a 22:00 gate polling to 23:30 while `use_shadow`/cutover settles | ≈ 5 min | the owner's load runs after the US close and finishes ≈ 18:45 ET |
+| `sr ingest --weekly` (actions, universe diff, adjust, DQ, catalogue, leakage smoke, manifest) | this box | Sat 06:00 | ≈ 20 min | Friday's nightly extract has landed; nothing trades |
+| `edgar-daily` fetcher → R2 `events/edgar/` | this box (cron) | Mon–Fri 22:30 | < 1 min | EDGAR's daily index is published after the 22:00 acceptance cut-off |
+| `fred-vintages` fetcher → R2 `events/fred/` | this box (cron) | Mon–Fri 17:30 | < 1 min | after most FRED releases |
+| `sr status --alert` (local watchdog) | this box (cron) | daily 07:00, Sat 09:00 (weekly manifest) | < 10 s | not independent of this box — accepted, because Fin-Lambda's `statusReport` SNS already alerts upstream independently |
+| `sr recon` (Tiingo 50-name sample) | this box | 1st Sat monthly, 09:00 | ≈ 1 h | 50 req/h |
+| Universe file update | this box (manual) | S&P 500 / DJIA: as announced (≈ 5 sessions before effective). NDX: December annual reconstitution + ad hoc. HSI: quarterly (at P4) | ≈ 1 h each, manual | each row needs a `source_url`; the S2 `portfolio_assets_info` diff flags misses weekly |
+| Restore drill | this box | yearly (events only) | ≈ 5 min | MySQL is canonical; `raw/` rebuilds the cache |
 
-#### 4.5.7 Upstream collectors — Fin-Lambda reuse and the myFinData migration
+#### 4.5.7 Upstream collectors — Fin-Lambda as-built (2026-10-29)
 
-*Added 2026-09-24 after scanning the two repositories that feed MySQL: `Fin-Lambda` at `fa1d6ac` (`Ops/fin-cron-data/`, ten scheduled Lambdas) and the local checkout of `myFinData` at `37c9493`. The local myFinData copy is **not** the production copy. Its logs end in June 2024, its config still names `histdailyprice6`, and this workstation has no crontab. The production host of the two cron jobs is found in U0 below.*
+*Added 2026-09-24 after scanning the two repositories that feed MySQL. **Status 2026-10-29:** the upstream track is **done or owner-run**. `Ops/fin-deep-data` is the confirmed live service (owner decision; `fin-cron-data` is frozen and retires at cutover). Phases A–F of Fin-Lambda's `PLAN-SR-UPSTREAM.md` are complete: python3.13 layer, all ten collectors, MySQL 8.4 migration, 426 unit tests. The `eodDaily`/`optChainEOD`/`statusReport` **shadow run has been live since 2026-10-06**, writing `histdailyprice7_shadow`, `OptionChains_shadow`, `corp_action_daily` and `load_audit` with exact `finished_at` timestamps, raw option chains to R2. The U0–U10 table below is retained as the build record; **U2, U2b (partial), U3, U4, U9, U10 are done; U6 cutover, the 2008 prepend over old history, and U7 archive are the owner's remaining steps.***
 
 **Repository boundary (D10).** Two repositories, split by who writes MySQL:
 
 | Repository | Owns | Writes | Conventions |
 |---|---|---|---|
-| **`Fin-Lambda`**: the upstream collector | every job that writes the owner's market-data MySQL, for all consumers (web predictions, trading, this project). It **absorbs myFinData's two live cron jobs**, and myFinData is archived after the cutover. | MySQL `GlobalMarketData`/`Trading`; its own R2/S3 prefixes (news, raw collector cache) | Fin-Lambda's own `CLAUDE.md`: flat handlers, `dataUtil`, Serverless v3, `HISTORY.md` + four `doc/` files |
-| **`Support-Resistance-Agent`**: the point-in-time spine and everything above it | P1 extract, lake, adjustment, `PITStore`, and the SR Lambdas (EDGAR, FRED, watchdog). Those Lambdas write SR's raw contract, not MySQL, so they stay here as a separate stack in the same AWS account. | only the `sr-agent` R2 bucket; MySQL is read-only | this document |
+| **`Fin-Lambda`** (`Ops/fin-deep-data`): the upstream collector | every job that writes the owner's market-data MySQL. myFinData's two live cron jobs are absorbed; myFinData archives after the cutover. | MySQL `GlobalMarketData`/`Trading`; its own R2 prefixes (news, raw collector cache, status) | Fin-Lambda's own `CLAUDE.md`: flat handlers, `dataUtil`, Serverless v3, `HISTORY.md` + four `doc/` files |
+| **`Support-Resistance-Agent`**: the point-in-time read path and everything above it | P1 extract, compute cache, adjustment, `PITStore`; EDGAR/FRED fetchers (this box, writing the R2 `events/` prefix). **No SR code runs on AWS.** | only the `sr-agent` R2 bucket's `events/` prefix; MySQL is read-only | this document |
 
-The spine does **not** get a third repository. L1 `data/` is imported in-process by L2–L5, and the leakage and determinism tests guard exactly those imports. A separate package would need versioned releases and cross-repo contract tests, which is overhead one developer does not need. The contract between the two repositories is **data, not code**: the tables and their semantics below, documented in Fin-Lambda's `doc/API-REFERENCE.md` and asserted by `tests/integration/test_upstream_contract.py` here.
+The spine does **not** get a third repository. L1 `data/` is imported in-process by L2–L5, and the leakage and determinism tests guard exactly those imports. The contract between the two repositories is **data, not code**: the tables and their semantics below, documented in Fin-Lambda's `doc/API-REFERENCE.md` and asserted by `tests/integration/test_upstream_contract.py` here.
 
 **Code is reused by porting, never by importing.** Fin-Lambda pins pandas 1.5 and SQLAlchemy 1.4 in its Lambda layers, uses flat imports, reads CSVs relative to the working directory and swallows errors. This repository is Python 3.11 with Polars and errors that raise. Ported functions keep a `# ported from Fin-Lambda <path>@<sha>` comment.
 
-**Inventory: what exists and what P1 does with it**
+**Inventory: what exists and what P1 does with it** (as-built 2026-10-29)
 
 | # | Upstream asset | Written by (schedule) | P1 use |
 |---|---|---|---|
-| 1 | `histdailyprice7` | myFinData `eoddata_ext_fetch.py -m` (cron `10 21 * * 1-5`, host-local) | **Spine** (§4.6.1). Migrated to Fin-Lambda `eodDaily` (U2) |
-| 2 | `OptionChains` | myFinData `optchain_fetch.py -S PM -U` (cron `40 21 * * 1-5`) | `option_daily` (§4.6.9). Migrated to Fin-Lambda `optChainEOD` (U3) |
-| 3 | `Trading.portfolio_assets_info` | Fin-Lambda `portAssetsHandler` (22:30 UTC, S&P 500 + NDX-100, a new dated set only on change, since 2026-08) | **Forward change detector** for `curated/index_membership.csv`: a new set raises a review item. The curated file stays the record because each row needs a `source_url` and an announcement timestamp. Extended to DJIA + HSI (U8) |
+| 1 | `histdailyprice7` (+ `_shadow`) | **Fin-Lambda `eodDaily`** (18:30 ET + shards + 19:00 sweep; shadow since 2026-10-06; pre-cutover: myFinData cron 21:10 host-local) | **Spine** (§4.6.1) |
+| 2 | `OptionChains` (+ `_shadow`) | **Fin-Lambda `optChainEOD`** (17:40 ET + 3 shards + sweep; raw chains → R2) | `option_daily` (§4.6.9) |
+| 3 | `Trading.portfolio_assets_info` | `portAssetsHandlerv2` (22:30 UTC, S&P 500 + NDX-100, dated sets on change, since 2026-08). **Pre-cutover state: both old and new membership functions disabled — the owner re-enables at U6.** | **Forward change detector** for `curated/index_membership.csv` (S2). Extended to DJIA + HSI (U8, done in code; enabled at cutover) |
 | 4 | `Product_List/stock_exchange.csv` (13 909 symbol → exchange rows) | manual | Seed for `symbol_map(source='mysql')` `Exchange` values; read once in M3 |
 | 5 | `port_assets_handler.py` parsers (`normalize_us_symbol`, `_pick_table`, `parse_sp500_wikipedia`, the Wikimedia User-Agent) and their fixtures | — | **Ported** into the M3 universe drafter. The dashed form (`BRK-B`) is what `histdailyprice7` stores |
-| 6 | `yf-news-collect.py` R2 client (boto3 with `endpoint_url`) | — | Pattern for `R2Store` (§4.4); SR uses its own bucket and tokens |
-| 7 | the loader's raw CSV cache on the production host: `Ops/yfinance/{sym}_{start}_{end}.csv`, `Ops/OptionsChain/`, `Ops/loadDB/` | myFinData, every run | **Archived once**, write-once, to R2 `sr-agent/raw/myfindata-cache/` (U7). A `{sym}_2010-01-01_{D}.csv` file dates that symbol's **first load exactly**, so where the file survives it replaces the bracket `b̂` of §4.6.1. In the local copy, 181 of 183 first loads are on 2023-04-26, and AAL 2010-01-04 has `Close` 4.770 vs `AdjClose` 4.497, which confirms `auto_adjust=False` semantics at that time |
+| 6 | `yf-news-collect.py` R2 client (boto3 with `endpoint_url`) | `yfNewshandler` (hourly) | Pattern reference only (SR's R2 use is `events/` only); **news writes 403 since 2026-10-14 — owner token fix pending** |
+| 7 | the loader's raw CSV cache on the production host: `Ops/yfinance/{sym}_{start}_{end}.csv`, `Ops/OptionsChain/`, `Ops/loadDB/` | myFinData, every run | **Archived once**, write-once, to R2 `raw/myfindata-cache/` (U7, pending). A `{sym}_2010-01-01_{D}.csv` file dates that symbol's **first load exactly**, so where the file survives it replaces the bracket `b̂` of §4.6.1. In the local copy, 181 of 183 first loads are on 2023-04-26, and AAL 2010-01-04 has `Close` 4.770 vs `AdjClose` 4.497, which confirms `auto_adjust=False` semantics at that time |
 | 8 | `USRates` (Fed H.15 page scrape) | `usrateHandler` | Not the rate source: FRED `DTB3` has full history and vintages. Optional cross-check |
-| 9 | `histminprice` (15-min bars) | `yfus30minEOD`, `yfasia30minEOD` | **Not consumed** (D1: no intraday modules) |
+| 9 | `histminprice` (15-min bars, US + Asia) | `yfus30minEOD`, `yfasia30minEOD` | **Not consumed in P1** (D1). Candidate intraday source if BP ever revisits D1 |
 | 10 | `snapshot`, options snapshot, `FX_snapshot` | `cronHandler`, `optHandler`, `FXrateHandler` | **Never consumed**: delete-then-append tables hold only the latest snapshot and cannot be point-in-time |
-| 11 | `FX_histdaily`, `famaFrench` | `FXHistHandler`, `fffHandler` (broken, Fin-Lambda TODOS §4.1) | Not consumed (per-market models in local currency) |
+| 11 | `FX_histdaily`, `famaFrench`, `USRates` history | `FXHistHandler`, `fffHandler` | Not consumed (per-market models in local currency) |
 | 12 | R2 `NEWS/`, `FINANCIALS/`, `STATISTICS/` JSON | `yfNewshandler` (hourly) | P4 candidate for text features, with `available_at = providerPublishTime` (else fetch time). Not in P1 |
 
 **What the loader code says** (read 2026-09-24; each item feeds M0 or U2):
@@ -1142,21 +1139,24 @@ The spine does **not** get a third repository. L1 `data/` is imported in-process
 | L6 | No load timestamp is written. | `available_at` for MySQL rows is assumed (close + lag, freshness-gated extract). | `load_audit.finished_at` gives it exactly for rows loaded after the cutover. |
 | L7 | Options: the underlying list is three CSVs (`etf_list`, `stock_list`, `us-cn_stock_list`; 194 names in the local copy, versus the owner's ≈ 50 in production). `UnderlyingPrice` = last `history()` close; `contractSize` is forced to 100; a same-day rerun reuses the cached CSV. | §4.6.9's field semantics rest on this behaviour. | Kept **identical**. The raw chain goes to R2 instead of the host disk. |
 
-**New and changed modules: how many.** P1 adds **no data-collection module beyond the five already in its design** (MySQL extractor, yfinance actions/reference, Tiingo, EDGAR, FRED) plus the watchdog. The upstream side adds **three Lambdas (two ports and a status report) and one extension** in Fin-Lambda:
+**New and changed modules: how many.** P1 adds **no data-collection module beyond the five already in its design** (MySQL extractor, yfinance actions/reference, Tiingo, EDGAR, FRED) plus the local watchdog. The upstream side is **built** (as above); the SR-side hooks are:
 
-| Id | Repo | Module | Type | What it does |
-|---|---|---|---|---|
-| U2 | Fin-Lambda | `eod_daily_handler.py` → `eodDaily` | **port** of `eoddata_ext_fetch.py` | Batched `yf.download` (≈ 200 tickers per call, pinned flags L1). Appends bars with `Date > max(Date)` per symbol to `histdailyprice7`, exactly as today. Downloads a 14-session window so late-posted actions are caught, and writes those actions to the new `corp_action_daily` (first-seen wins). Writes `load_audit`. Sharded under the 15-min rule below (`EOD_SHARDS`, default 1). The same handler runs the one-off prepend (U2b) with event `{"prepend": true}`. |
-| U3 | Fin-Lambda | `optchain_eod_handler.py` → `optChainEOD` | **port** of `optchain_fetch.py` | Same columns and semantics as `OptionChains` (L7). Writes `load_audit`; the raw chain CSV goes to R2. **Sharded by default** (`OPT_SHARDS=3`) plus a sweep, under the 15-min rule below. |
-| U9 | Fin-Lambda | `status_report_handler.py` → `statusReport` | **new** | Daily status report: one line per data set, giving **DataName (table), last data date, last run date and time, status, symbols ok/expected, rows** (format below). Sent by SNS e-mail, written to R2 `status/latest.json`, printed on a local run. |
-| U10 | Fin-Lambda | the other daily handlers (`usrateHandler`, `FXHistHandler`, `yfus30minEOD`, `yfasia30minEOD`, `portAssetsHandler`) | **change** | One `DU.audit_run()` call each, writing a summary row to `load_audit`, so they appear in the report with real run times. |
-| U8 | Fin-Lambda | `port_assets_handler.py` | **extension** | Adds DJIA (row band 30–30) and HSI (band 50–110) next to SP500/NDX100. M0 asks what writes the existing DJI/HSI rows today. |
-| U4 | Fin-Lambda | `dataUtil.append_ignore()`, `dataUtil.audit_run()`, two tables + one view | shared | DDL below. `sql_require_primary_key=ON`, so both tables are created by hand before the first write. |
-| S1 | SR | `MySqlExtractor` | change | The nightly extract is **triggered by `load_audit`** (polling from 19:00 ET) instead of the 22:00 freshness gate, which stays as the fallback. `available_at = load_audit.finished_at` for rows loaded after the cutover. Before the cutover it stays close + `bar_publication_lag_minutes`. |
-| S2 | SR | `UniverseBuilder` | change | Diffs `portfolio_assets_info` against the curated file every week and opens a review item for each difference. |
-| S3 | SR | `corporate_action` build | change | `corp_action_daily` becomes the action source for names delisted **after** the cutover (they carry their own actions). Tiingo remains the source for names delisted before it. |
-| S4 | SR | `sr mysql import-cache` | one-off | Reads the archived cache (inventory #7) and sets `security_master.mysql_first_load_date`, which overrides `b̂` in §4.6.1. |
-| S5 | SR | `sr status` | change | Prints SR's own `ingest_run` and the upstream `v_load_status` in the U9 format. The watchdog Lambda alerts on the same fields. |
+| Id | Repo | Module | Type | What it does | Status |
+|---|---|---|---|---|---|
+| U2 | Fin-Lambda | `eod_daily_handler.py` → `eodDaily` | **port** of `eoddata_ext_fetch.py` | Batched `yf.download` (≈ 200 tickers per call, pinned flags L1). Appends bars with `Date > max(Date)` per symbol to `histdailyprice7(_shadow)`. Downloads a 14-session window so late-posted actions are caught, and writes those actions to `corp_action_daily` (first-seen wins). Writes `load_audit`. Sharded (`EOD_SHARDS`). The same handler runs the one-off prepend (U2b) with event `{"prepend": true}`. | **done** (shadow live) |
+| U3 | Fin-Lambda | `optchain_eod_handler.py` → `optChainEOD` | **port** of `optchain_fetch.py` | Same columns and semantics as `OptionChains` (L7). Writes `load_audit`; the raw chain CSV goes to R2. **Sharded** (`OPT_SHARDS=3`) plus a sweep. | **done** (shadow live) |
+| U9 | Fin-Lambda | `status_report_handler.py` → `statusReport` | **new** | Daily status report (one line per data set, format below), SNS e-mail, R2 `status/latest.json`. | **done** (20:00 ET) |
+| U10 | Fin-Lambda | `DU.audit_run()` in the other daily handlers | **change** | Summary rows in `load_audit` so all data sets appear in the report with real run times. | **done** |
+| U8 | Fin-Lambda | `port_assets_handler.py` | **extension** | Adds DJIA (row band 30–30) and HSI (band 50–110) next to SP500/NDX100. | **done in code**; runs at cutover (both membership jobs currently disabled) |
+| U4 | Fin-Lambda | `dataUtil.append_ignore()`, `audit_run()`, two tables + one view | shared | DDL below. Created by hand (`sql_require_primary_key=ON`). | **done** |
+| U6 | Fin-Lambda | **Cutover** | owner | On a Friday: point the Lambda env at the production tables, `serverless deploy`, disable the old crontab. Rollback = re-enable the cron lines. **⚠ 2026-10-29: `serverless.yml` still has the four live schedules `enabled: false` — a routine redeploy before cutover would silently stop the shadow run.** Flip it only at cutover. | **pending (owner)** |
+| U2b | Fin-Lambda | 2008 prepend over pre-shadow history | owner runs | One-off `{"prepend": true}` so pre-2023 first-loads gain 2008→ history; delisted names get nothing (BP §17.2 A8). | **pending (owner)** |
+| U7 | Fin-Lambda | Archive the myFinData host cache to R2 | owner | Write-once; enables S4 (`mysql_first_load_date`). | **pending (owner)** |
+| S1 | SR | `MySqlExtractor` | change | The nightly extract is **triggered by `load_audit`** (polling from 19:00 ET) instead of the 22:00 freshness gate, which stays as the fallback. `available_at = load_audit.finished_at` for rows loaded after the shadow-run start. Before that, close + `bar_publication_lag_minutes`. | **build in Stage A** |
+| S2 | SR | `UniverseBuilder` | change | Diffs `portfolio_assets_info` against the curated file every week and opens a review item for each difference. | **build in Stage A** |
+| S3 | SR | `corporate_action` build | change | `corp_action_daily` (with `first_seen_at`) is the action source for rows it covers; yfinance/Tiingo cover the rest. | **build in Stage A** |
+| S4 | SR | `sr mysql import-cache` | one-off | Reads the archived cache (inventory #7) and sets `security_master.mysql_first_load_date`, which overrides `b̂` in §4.6.1. | **build in Stage A** |
+| S5 | SR | `sr status` | change | Prints SR's own `ingest_run` and the upstream `v_load_status` in the U9 format. The local watchdog alerts on the same fields. | **build in Stage A** |
 
 ```sql
 -- Fin-Lambda, GlobalMarketData schema. Created manually (sql_require_primary_key=ON).
@@ -1247,7 +1247,7 @@ Symbols already in MySQL start in 2010. **U2b** prepends 2008-01-01 → `MIN(Dat
 - Its rows are rescaled for every split up to the prepend date, not the original first-load date. §4.6.1 handles this with the per-row load date `L_t`.
 - Delisted names get nothing from it; their coverage rule is BP §17.2 A8.
 
-**Executable plan: the upstream track.** It runs alongside M0–M8. **The P1 gate does not depend on it.** The spine works on the current loader, and the migration only changes rows written after the cutover; no history is touched.
+**Executable plan: the upstream track.** It ran alongside M0–M8. **The P1 gate does not depend on it.** The spine works on the current loader, and the migration only changes rows written after the cutover; no history is touched. *Status 2026-10-29: U1–U5, U8–U10 **done**; U6, U2b-over-old-history, U7 **pending (owner)**.*
 
 | Step | Owner | Work | Done when | Est. |
 |---|---|---|---|---|
@@ -1264,16 +1264,25 @@ Symbols already in MySQL start in 2010. **U2b** prepends 2008-01-01 → `MIN(Dat
 | **U9** | Claude | `statusReport` Lambda + `tests/unit/test_status_report_handler.py` (status rules ok/partial/error/stale, shard aggregation, the `(inferred)` fallback, formatting); SNS topic; R2 `status/latest.json`. | the report runs during the shadow run and shows both old and new jobs | 3 h |
 | **U10** | Claude | `DU.audit_run()` in the five other daily handlers; one test each for the audit row. | all daily data sets in the report with real run times | 2 h |
 
-Upstream total ≈ **24 h**, logged in Fin-Lambda's `HISTORY.md` and its `doc/` files (its rules). SR-side changes S1–S5 and the per-row load date in §4.6.1 add ≈ 3 h to M3/M4/M7.
+Upstream total ≈ **24 h** — **spent** (Fin-Lambda `HISTORY.md` is its record). SR-side changes S1–S5 and the per-row load date in §4.6.1 are part of Stage A below.
 
-**After the cutover** (America/New_York): `eodDaily` Mon–Fri 18:30 (shards 18:30 + 3 min each, sweep +30 min); `statusReport` Mon–Fri 20:00; `optChainEOD` three shards and a sweep starting at the time the PM job runs now, converted to ET once U0 gives the host time zone, so the options series stays homogeneous. If that time moves with DST, it is fixed at its summer value. The SR nightly extract then starts on the `load_audit` signal (≈ 18:45) instead of 22:00, and the 22:00–23:30 gate remains the fallback.
+**After the cutover** (America/New_York): `eodDaily` Mon–Fri 18:30 (shards 18:30 + 3 min each, sweep +30 min); `statusReport` Mon–Fri 20:00; `optChainEOD` three shards and a sweep at their current ET-fixed times. The SR nightly extract starts on the `load_audit` signal (≈ 18:45), and the 22:00–23:30 gate remains the fallback.
 
-**Test section.**
+**Test section (upstream).**
 
 - *No regression:* the 59 offline tests and the pre-commit gate are unchanged. Nothing in this repository imports Fin-Lambda.
-- *New here:* `tests/integration/test_upstream_contract.py` (`-m integration`, live MySQL read-only) asserts the column sets and PKs of `histdailyprice7`, `OptionChains`, `load_audit` and `corp_action_daily`, and that every `load_audit` row since the cutover has `yf_version` set. `test_mysql_extract.py` gains `available_at` from `load_audit`. `test_split_state.py` gains "a cache-archive first-load date overrides `b̂`" and "a prepend segment with a later load date recovers to continuous traded prices across the 2009/2010 seam". `test_status.py` covers `sr status` formatting from a fixture view. `test_universe.py` gains the `portfolio_assets_info` diff.
-- *New in Fin-Lambda:* one pytest file per new Lambda (its rule), U2/U3 dry runs as the golden-CSV baseline, and the shadow-diff procedure in its `doc/OPERATIONS.md`.
-- *Removed:* none. The myFinData jobs have no tests to retire.
+- *New here:* `tests/integration/test_upstream_contract.py` (`-m integration`, live MySQL read-only) asserts the column sets and PKs of `histdailyprice7`, `OptionChains`, `load_audit` and `corp_action_daily`, and that every `load_audit` row since the shadow-run start has `yf_version` set. `test_mysql_extract.py` gains `available_at` from `load_audit`. `test_split_state.py` gains "a cache-archive first-load date overrides `b̂`" and "a prepend segment with a later load date recovers to continuous traded prices across the 2009/2010 seam". `test_status.py` covers `sr status` formatting from a fixture view. `test_universe.py` gains the `portfolio_assets_info` diff.
+- *In Fin-Lambda:* done — one pytest file per new Lambda (its rule), U2/U3 dry runs as the golden-CSV baseline, the shadow-diff procedure in its `doc/OPERATIONS.md`. Its suite stands at **426 passing** (2026-10-14).
+
+**Stage-A risk register** (deltas from BP §12):
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Shadow tables diverge from production (schema drift while U6 slips) | low | medium | `use_shadow` is one config flag; the extractor treats both as the same contract via `test_upstream_contract.py` |
+| The membership collector stays disabled and `portfolio_assets_info` goes stale | **live** | low | S2 diff compares vs curated weekly; the curated file remains the record — this only delays the forward detector |
+| This box sleeps/reboots and misses a nightly | medium | low | cron with `--alert`; the next run's 40-session overlap window self-heals; `sr status --alert` flags > 1 missed session |
+| DO Trusted Sources lacks this box's IP (or NAT egress IP changes) | medium | high | extract fails loudly at the freshness gate; fallback: read replica, or owner allow-lists the IP |
+| MySQL availability during the Saturday full-build window | low | medium | resumable `ingest_run` steps; off-peak window; extract is read-only |
 
 ### 4.6 Algorithms & formulas
 
@@ -1438,9 +1447,14 @@ mismatch  → full re-extract of that security into a new raw object; ingest_run
 `OptionChains` is yfinance's `option_chain()` output, captured once per US trading day after the close. The owner's load finishes before the HK open. The table has no capture timestamp, so:
 
 ```
-available_at = close_ts(D) + options_publication_lag      options_publication_lag = 330 min (initial, conservative: the load
-                                                            is complete by the HK open, 21:30 ET in summer); tightened to the
-                                                            measured load-finish time in M0
+rows written by Fin-Lambda optChainEOD (shadow 2026-10-06 →, production after U6):
+    available_at = load_audit.finished_at of the chain's shard row      (exact, per underlying)
+pre-shadow history (no audit row):
+    available_at = close_ts(D) + options_publication_lag                options_publication_lag = 330 min
+                                                                        (initial, conservative: the load is
+                                                                        complete by the HK open, 21:30 ET in
+                                                                        summer); tightened to the measured
+                                                                        load-finish time in M0
 ```
 
 | Column | Treatment | Why |
@@ -1474,7 +1488,7 @@ Offline unless marked. New fixtures in `tests/conftest.py`: `synthetic_raw_tree`
 | `tests/unit/data/test_universe.py` | loader rejects rows without `source_url`/`security_id`, overlapping intervals per index; multi-index membership; Form 25 / HKEXnews closes; ticker reuse → two ids | b |
 | `tests/unit/data/test_universe_gate.py` *(needs a built lake; skipped otherwise)* | §4.6.4 step 5 ≥ 60; coverage table for 4 indexes | **b** |
 | `tests/leakage/test_pit.py` | §4.6.6 probes, static checks, four trap tests | **c** |
-| `tests/unit/data/test_store.py` | `AsOfQuery` SQL and binding; allow-list; non-session `as_of` rejected; local and `r2://` URIs resolve | c |
+| `tests/unit/data/test_store.py` | `AsOfQuery` SQL and binding; allow-list; non-session `as_of` rejected; cache-path URIs resolve | c |
 | `tests/unit/data/test_calendar.py` | `sessions('2026-09-11', 5)`; a half-day counts; a curated HK typhoon closure removes the session | — |
 | `tests/unit/data/test_ingest_incremental.py` | overlap match appends; mismatch → full re-extract; landing drops `available_at > extract_ts` | — |
 | `tests/unit/data/test_quota.py`, `test_edgar.py`, `test_fred.py`, `test_quality.py` | as named | — |
@@ -1487,28 +1501,28 @@ No existing test is weakened or removed. `test_ingestion.py::test_cache_is_immut
 
 ### 4.8 Deliverables — implementation milestones
 
-Effort assumes BP §12's 15–20 h/week. The estimate is ≈ 47 h ≈ Weeks 2–4 in this repository, plus ≈ 24 h for the upstream track in Fin-Lambda (§4.5.7 U0–U8), which runs in parallel and does not gate P1. This is **about half a week more than BP's Weeks 2–3**: HK and the four-host deployment add work, while dropping S&P 400 removes some. Each milestone ends green on the pre-commit gate with a `HISTORY.md` entry.
+Effort assumes BP §12's 15–20 h/week. **Re-cut 2026-10-29 (owner storage decision):** the four-host deployment (VPS, SAM stack, R2 lake) is gone, so the estimate falls from ≈ 47 h to **≈ 34–40 h ≈ Weeks 2–3**, while the upstream track (≈ 24 h) is already **spent** in Fin-Lambda (§4.5.7). HK data curation moved to P4, removing ≈ 2 h here. Each milestone ends green on the pre-commit gate with a `HISTORY.md` entry.
 
 | # | Milestone | Est. | Exit criterion |
 |---|---|---|---|
-| M0 | **Residual audit** (most answered 2026-09-24, §4.5.1): row counts and `MIN(Date)` per `Exchange`; `Section` values; universe coverage (`sr mysql coverage`); split-state on AAPL/TSLA/NVDA; load-finish time; HK symbol convention; **U0** (production host, time zone, yfinance version, loader cache). Tiingo on 3 delisted US names; EDGAR `-index.htm`; R2 bucket, tokens and bucket-lock availability | 3.5 h | `research/spikes/p1.md`; §4.5.3–§4.5.6 estimates replaced by measurements; L1/L2 of §4.5.7 resolved to facts |
-| M1 | Infrastructure: VPS provisioning (uv, systemd, lock, firewall), DO trusted source + `sr_reader`, R2 bucket/tokens, SAM stack skeleton | 4 h | a hello-world timer on the VPS writes to R2; the Lambda watchdog reads it |
-| M2 | Storage foundation: `ObjectStore`, `LakeWriter`, `AsOfQuery`, `PITStore`, `SessionCalendar` + closures, catalogue refresh | 5 h | `test_store`, `test_calendar`, `test_objectstore`, `test_lake_replay` green |
-| M3 | Universe: drafter for four indexes, curation (S&P 500 ≈ 6 h, NDX ≈ 2 h, DJIA ≈ 0.5 h, HSI ≈ 2 h), `UniverseBuilder` + the `portfolio_assets_info` diff (S2), EDGAR Form 25/15 | 10.5 h | `test_universe` green; the security list feeds the extract |
-| M4 | Prices: `MySqlExtractor` (bars + options), spine chain, `YFinanceIngestor`, `TiingoIngestor` + `QuotaLedger`, incremental + restatement; `load_audit` trigger and `available_at` (S1); `corp_action_daily` (S3); `sr mysql import-cache` (S4) | 9 h | `test_mysql_extract`, `test_spine`, `test_ingest_incremental`, `test_quota` green; full extract landed |
-| M5 | Corporate actions + point-in-time adjustment + reconciliation | 5 h | `test_adjust`, `test_raw_reconstruct`, `test_recon` green; **gate a** live |
-| M6 | DQ, EDGAR/FRED Lambdas, watchdog, systemd timers | 4 h | nightly + weekly ran unattended once; watchdog green |
-| M7 | Leakage suite; P0 → `PITStore`; `sr status` (S5); `.env.example` (`MYSQL_*`, `R2_*`, `FRED_API_KEY`, `SEC_USER_AGENT`, `SR_HISTORY_START=2008-01-01`) | 4 h | **gate c** green |
-| M8 | Gate run, `research/universe_coverage.md`, doc updates | 2 h | **gate b** green; P1 gate recorded in HISTORY; one restore drill passed |
+| M0 | **Residual audit** (most answered 2026-09-24, §4.5.1): row counts and `MIN(Date)` per `Exchange` and per `Section`; universe coverage (`sr mysql coverage` on the 3-index list); split-state on AAPL/TSLA/NVDA; shadow-vs-prod freshness from `load_audit` (live since 2026-10-06). Tiingo on 3 delisted US names; EDGAR `-index.htm`; R2 bucket + token for `events/` | 2 h | `research/spikes/p1.md`; §4.5.3–§4.5.5 estimates replaced by measurements; L1/L2 of §4.5.7 resolved to facts |
+| M1 | Access + skeleton: DO trusted source (this box's IP) + `sr_reader`, TLS, `.ingest.lock`, cron scaffolding, R2 `events/` token | 1.5 h | a hello-world extract reads `v_load_status` over TLS from this box |
+| M2 | Storage foundation: `CacheWriter`, `AsOfQuery`, `PITStore`, `SessionCalendar` + closures, catalogue refresh | 4.5 h | `test_store`, `test_calendar`, `test_cache_replay` green |
+| M3 | Universe: drafter for **three** US indexes, curation (S&P 500 ≈ 6 h, NDX ≈ 2 h, DJIA ≈ 0.5 h), `UniverseBuilder` + the `portfolio_assets_info` diff (S2), EDGAR Form 25/15 | 9.5 h | `test_universe` green; the security list feeds the extract |
+| M4 | Prices: `MySqlExtractor` (bars + options + audit), spine chain, `YFinanceIngestor`, `TiingoIngestor` + `QuotaLedger`, incremental + restatement; `load_audit` trigger and `available_at` (S1); `corp_action_daily` (S3); `sr mysql import-cache` (S4, runs once U7 lands) | 8 h | `test_mysql_extract`, `test_spine`, `test_ingest_incremental`, `test_quota` green; full extract landed |
+| M5 | Corporate actions + point-in-time adjustment + reconciliation | 4.5 h | `test_adjust`, `test_raw_reconstruct`, `test_recon` green; **gate a** live |
+| M6 | DQ, EDGAR/FRED fetchers (this box → R2 `events/`), local watchdog, cron entries | 2.5 h | nightly + weekly ran unattended once; `sr status --alert` green |
+| M7 | Leakage suite; P0 → `PITStore`; `sr status` (S5); `.env.example` (`MYSQL_*`, `R2_*` events, `FRED_API_KEY`, `SEC_USER_AGENT`, `SR_HISTORY_START=2008-01-01`) | 3.5 h | **gate c** green |
+| M8 | Gate run, `research/universe_coverage.md`, doc updates | 1.5 h | **gate b** green; P1 gate recorded in HISTORY |
 
 Checklist:
 
-- [ ] `MySqlExtractor`, `YFinanceIngestor`, `TiingoIngestor`, `EdgarClient`, `FredClient`, `ObjectStore`/`R2Store`, `LakeWriter`, `PointInTimeAdjuster`, `SessionCalendar`, `UniverseBuilder`, `DQScorer`, `PITStore`.
-- [ ] `curated/index_membership.csv` (SP500, NDX, DJIA, HSI; 2010→), `curated/exchange_closures.csv`, `curated/corporate_actions_manual.csv`, `research/universe_coverage.md`.
-- [ ] VPS systemd units; AWS SAM stack (3 Lambdas, scheduler, SNS, SSM); R2 bucket with tokens.
+- [ ] `MySqlExtractor`, `YFinanceIngestor`, `TiingoIngestor`, `EdgarClient`, `FredClient`, `CacheWriter`, `PointInTimeAdjuster`, `SessionCalendar`, `UniverseBuilder`, `DQScorer`, `PITStore`.
+- [ ] `curated/index_membership.csv` (SP500, NDX, DJIA; 2010→; HSI joins at P4), `curated/exchange_closures.csv`, `curated/corporate_actions_manual.csv`, `research/universe_coverage.md`.
+- [ ] Cron entries (nightly, weekly, EDGAR, FRED, watchdog) on this box; R2 token for `events/`.
 - [ ] P0 reads through `PITStore` (`sr p0 --store`), including one delisted name as of a date it traded (e.g. XLNX as of 2021-06-30): the survivorship case P0 on yfinance could not run.
-- [ ] Upstream track (Fin-Lambda, §4.5.7): U0–U10, shadow diff passed, cutover done, 2008 prepend run, status report live, myFinData archived. Not a P1 gate item.
-- [ ] Unit, leakage and determinism suites in the pre-commit gate; recon and R2 contract tests as `-m integration`.
+- [ ] Upstream (Fin-Lambda, §4.5.7): shadow run live ✓; remaining owner items — U6 cutover (fix the `enabled: false` schedules first), the 2008 prepend over old history, U7 archive. **Not a P1 gate item.**
+- [ ] Unit, leakage and determinism suites in the pre-commit gate; recon and MySQL contract tests as `-m integration`.
 
 ---
 

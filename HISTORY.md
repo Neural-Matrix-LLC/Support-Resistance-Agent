@@ -5,6 +5,20 @@ reverse-chronological order. See `CLAUDE.md` for the rule this file follows.
 
 ---
 
+## 2026-10-29 — P1 re-plan: storage on Fin-Lambda's MySQL (docs only)
+
+**Goal.** Apply the owner's 2026-10-29 decisions from the Fin-Lambda review: (1) `Ops/fin-deep-data` is the live collector (not `fin-cron-data`); (2) MySQL stays the canonical store, R2 holds news/events only; (3) no VPS, no SR-side AWS. Tech doc §4 re-planned in place → **v0.5**.
+
+- **D1/D6/D9/D10 amended.** D6: point-in-time read path keeps immutable raw extracts + DuckDB compute cache on the workstation; MySQL canonical; the R2 canonical lake, Hostinger VPS and SR Lambdas (EDGAR/FRED/watchdog) are dropped. D9: R2 = events archive only (`events/{edgar,fred}/` written by this box). D10: upstream as-built status recorded (shadow run live since 2026-10-06, 426 tests, U6/U2b/U7 pending on the owner).
+- **§4.2/§4.3 diagrams redrawn.** Architecture now shows Fin-Lambda functions → MySQL → `MySqlExtractor` (with `load_audit` → exact `available_at`) → raw → cache → `PITStore`; deployment is three hosts (MySQL, AWS=Fin-Lambda, this box; R2 events-only). Workflows updated: freshness gate reads `v_load_status`; nightly pulls the audit tail; EDGAR/FRED run as local cron with R2 `events/` + local mirror.
+- **§4.4 classes.** `LakeWriter`/`ObjectStore`/`LocalStore`/`R2Store` replaced by `CacheWriter` (+ `MySqlExtractor.extract_load_audit`, `UniverseBuilder.diff_portfolio_assets`). Module table updated (S1–S5 built in Stage A; U-status column added; `sr lake pull/restore` removed).
+- **§4.5.** Sources table gains `load_audit`/`corp_action_daily` rows and the shadow-table caveat; sizing re-cut to the 3-index US universe (≈ 0.5 GB excl. options); R2 section rewritten (events-only, local mirror, no restore drill for market data); schedules all on this box with the Fin-Lambda upstream schedule listed separately; §4.5.7 marked as-built with a U-status column and the ⚠ `enabled: false` redeploy hazard.
+- **§4.6.9.** Options `available_at` = `load_audit.finished_at` per chain row from 2026-10-06 onward; the 330-min lag inference applies only to pre-shadow history.
+- **§4.7/§4.8.** Contract test notes updated; Stage-A risk register added (shadow drift, stale membership feed, box reboot, DO trusted-source IP, Saturday scan). Milestones re-cut ≈ 47 h → **≈ 34–40 h** (M0 2 h … M8 1.5 h); checklist updated (no VPS/SAM; HSI at P4).
+- **P0 regression check:** none possible yet (docs only); the 59 tests are untouched. New plan file `.hermes/plans/2026-10-29_sr-agent-implementation-plan.md` carries the stage flip (A/B/C now, infra deferred behind the P2 gate).
+
+---
+
 ## 2026-09-24 — P1 plan: owner review of the upstream migration (docs only)
 
 **Goal.** Apply the owner's four review points on the Fin-Lambda / myFinData plan (tech doc §4.5.7, §4.6.1, §4.8; BUILD-PLAN §17.2 A7–A8, §17.3, §17.4).
