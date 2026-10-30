@@ -3,6 +3,7 @@ clusterer → Monte Carlo → report."""
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -116,7 +117,75 @@ def run_p0(bars: Bars, n_paths: int, seed: int) -> P0Result:
 
 @app.callback()
 def _root() -> None:
-    """Keep `sr p0 ...` as a subcommand even while it is the only one."""
+    """`sr p0` (P0) · `sr mysql` / `sr cache` / `sr status` (P1 Stage A)."""
+
+
+mysql_app = typer.Typer(help="MySQL extractor: audit, ingest (M0/M2)")
+app.add_typer(mysql_app, name="mysql")
+
+
+@mysql_app.command("audit")
+def mysql_audit_cmd(
+    data_dir: Annotated[Path, typer.Option(help="cache root; $SR_DATA_DIR")] = DEFAULT_DATA_DIR,
+    offline_from: Annotated[Path | None, typer.Option(help="re-print a saved audit JSON")] = None,
+) -> None:
+    """M0: measure what the upstream MySQL holds (§4.5.1); saves a JSON audit."""
+    from sr_agent.data.p1_ops import mysql_audit
+
+    results = mysql_audit(data_dir, offline_from)
+    for k, v in results.items():
+        typer.echo(f"{k:24} {json.dumps(v, default=str)[:160]}")
+    if results.get("ok") is False:
+        raise typer.Exit(code=4)  # audit ran but queries failed (DB unreachable)
+
+
+@mysql_app.command("ingest")
+def mysql_ingest_cmd(
+    symbols: Annotated[list[str], typer.Argument(help="tickers to extract")],
+    data_dir: Annotated[Path, typer.Option(help="cache root")] = DEFAULT_DATA_DIR,
+    table: Annotated[str, typer.Option(help="configured table key")] = "histdailyprice7",
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2000-01-01",
+    end: Annotated[str | None, typer.Option(help="YYYY-MM-DD; default today")] = None,
+) -> None:
+    """M2: per-symbol SELECTs → immutable raw extracts (never the read path)."""
+    from sr_agent.data.p1_ops import mysql_ingest
+
+    counts = mysql_ingest(list(symbols), data_dir, table, start, end)
+    typer.echo(
+        f"extracted {counts['symbols']} symbols, {counts['rows']} rows → {data_dir}/raw/mysql/"
+    )
+
+
+cache_app = typer.Typer(help="Cache rebuild + catalogue (M7)")
+app.add_typer(cache_app, name="cache")
+
+
+@cache_app.command("rebuild")
+def cache_rebuild_cmd(
+    table: Annotated[str, typer.Argument(help="e.g. histdailyprice7")],
+    data_dir: Annotated[Path, typer.Option(help="cache root")] = DEFAULT_DATA_DIR,
+    partition_by: Annotated[str, typer.Option(help="comma-separated partition cols")] = "Symbol",
+) -> None:
+    """Fold raw extracts → deterministic Parquet partitions → catalogue view."""
+    from sr_agent.data.p1_ops import cache_rebuild
+
+    res = cache_rebuild(data_dir, table, [p for p in partition_by.split(",") if p])
+    sha = str(res["sha256"])
+    typer.echo(f"{res['table']}: {res['rows']} rows, sha256 {sha[:12]}")
+
+
+@app.command()
+def status(
+    data_dir: Annotated[Path, typer.Option(help="cache root")] = DEFAULT_DATA_DIR,
+) -> None:
+    """M8: freshness + manifest digests; exit 3 when stale (watchdog hook)."""
+    from sr_agent.data.p1_ops import status as p1_status
+
+    out = p1_status(data_dir)
+    typer.echo(json.dumps(out, indent=2, default=str))
+    if not out.get("ok", False):
+        raise typer.Exit(code=3)
+
 
 
 @app.command()

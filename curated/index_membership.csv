@@ -1,0 +1,6 @@
+index_name,ticker_at_time,security_id,cik_or_hkex_code,start_date,end_date,source_url,evidence_grade
+SP500,AAPL,1,320193,2018-01-01,,https://en.wikipedia.org/wiki/List_of_S%26P_500_companies,A
+SP500,MSFT,2,789019,2010-01-01,,https://en.wikipedia.org/wiki/List_of_S%26P_500_companies,A
+SP500,GE,3,40545,2010-01-01,2018-06-26,https://en.wikipedia.org/wiki/List_of_S%26P_500_companies,A
+SP500,WLTW,4,1481586,2014-07-01,2020-04-06,https://en.wikipedia.org/wiki/List_of_S%26P_500_companies,A
+SP500,WLTW,5,1481586,2020-04-07,,https://www.spglobal.com/indexes/,B

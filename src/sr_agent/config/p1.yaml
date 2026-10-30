@@ -1,0 +1,49 @@
+# Stage-A (P1) extractor knobs — all `initial`, tuned inside M-milestones only
+# as the tech doc allows. Nothing here is frozen (BUILD-PLAN does not fix these).
+p1:
+  # §4.6.1 inference for pre-load_audit rows: rows written before the shadow
+  # run (2026-10-06) have no audit row; infer each symbol's first-load date.
+  first_load_fallback: "2023-04-26"   # measured: 181/183 myFinData first loads
+  per_row_load_date: true             # raw_t = Close_t · Π_{t<ex_u≤L_t} r_u
+
+  # Nightly incremental overlap (§4.6.7): re-extract this many sessions to
+  # detect restatement of recently landed rows.
+  overlap_sessions: 3
+  # A mismatch in the overlap → full re-extract of the symbol.
+  full_reextract_on_mismatch: true
+
+  # Freshness gate (§4.5.6 rev): `sr ingest --nightly` refuses to run (exit 3)
+  # when v_load_status reports the upstream load older than this many sessions.
+  max_load_age_sessions: 2
+
+  # Reconciliation sample (§4.6.2): size of the Tiingo cross-check sample.
+  recon_sample: 50
+  recon_newest: 10
+  recon_tolerance: 0.005              # 0.5 % close diff allowed (adj conventions)
+
+  # DQ gate (§4.6.3): a symbol below this is excluded from zones (dq_suppress
+  # governs reporting; this governs inclusion in the research panel).
+  dq_min_sessions: 200
+
+  # DuckDB cache (§4.5.3 rev): rebuild order is (extract_date, source, object).
+  cache_dir: data/lake
+  raw_dir: data/raw
+  catalog: data/sr.duckdb
+  # Tables folded by the nightly rebuild (order matters for the catalogue).
+  cache_tables: [histdailyprice7, corp_action_daily, load_audit]
+  # M2 seed symbols (before universe curation lands; subset is fine).
+  universe_seed_symbols: [AAPL, MSFT, GE]
+
+  # Tiingo quota ledger (free tier, hard caps — refuse rather than exceed).
+  tiingo:
+    max_requests_day: 1000
+    max_requests_hour: 50
+    max_symbols_month: 500
+
+  # Cron schedule definitions (ops/schedules.py renders crontabs from this).
+  schedules:
+    mysql_nightly: "30 2 * * 2-6"     # 22:30 ET ≈ 02:30 UTC, Tue–Sat (after US close)
+    edgar_nightly: "30 22 * * 1-5"    # 22:30 UTC Mon–Fri
+    fred_nightly: "30 17 * * 1-5"     # 17:30 UTC Mon–Fri
+    weekly_refresh: "0 6 * * 6"       # Sat 06:00 UTC
+    recon_monthly: "0 7 * * 6 #1"     # 1st Sat 07:00 UTC

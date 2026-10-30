@@ -1,0 +1,50 @@
+# MySQL extraction settings (§4.5.3 rev). Values are environment references —
+# never hardcode credentials. SR reads with a SELECT-only account (sr_reader).
+# D6: backtests NEVER query MySQL live; this module only produces immutable
+# raw extracts under data/raw/mysql/ that the cache is rebuilt from.
+mysql:
+  # Resolution order per value: env var → literal. ${ENV:default} is supported.
+  host: ${SR_MYSQL_HOST}
+  port: ${SR_MYSQL_PORT:3306}
+  user: ${SR_MYSQL_USER}
+  password: ${SR_MYSQL_PASSWORD}
+  database: ${SR_MYSQL_DB:GlobalMarketData}
+  # TLS is mandatory; the DO cluster terminates it publicly.
+  ssl: true
+
+  # Connect-timeout seconds; a slow WAN must not hang the nightly run.
+  connect_timeout: 20
+
+  # Read-only guard: this account must refuse to run anything that is not a
+  # SELECT. The extractor asserts it by running `SELECT 1` (works) and
+  # rejecting non-SELECT statements before they are sent.
+  read_only: true
+
+# Table → extract mapping. `extract_sql` is a {as_of_start, as_of_end}-
+# parameterised SELECT that must be deterministic (fixed ORDER BY) so the
+# same extract re-run twice is byte-identical (§4.6.8).
+tables:
+  histdailyprice7:
+    shadow_table: histdailyprice7_shadow   # read until the U6 cutover, then null
+    chunk_by: Symbol                        # extract one symbol per query
+    order_by: "Symbol, Date, Time"          # deterministic fold order
+    columns:                                # keep ALL raw columns; parse later
+      - Date
+      - Symbol
+      - Exchange
+      - Open
+      - High
+      - Low
+      - Close
+      - AdjClose
+      - Volume
+
+corp_action:
+  table: corp_action_daily          # Fin-Lambda 2026-10-06+; pre-2026-10-06 the
+                                    # actions come from yfinance/tiingo backfill
+  order_by: "Symbol, ExDate, Action"
+
+load_audit:
+  table: load_audit                 # Fin-Lambda per-symbol/shard finish times
+  view: v_load_status               # freshness gate + `sr status`
+  tail_rows: 5000                   # nightly pull size
